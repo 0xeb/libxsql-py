@@ -1,0 +1,48 @@
+site_name: libxsql for Python
+site_description: Pythonic SQLite virtual tables and query infrastructure
+site_author: Elias Bachaalany
+repo_url: https://github.com/0xeb/libxsql-py
+repo_name: 0xeb/libxsql-py
+strict: true
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+
+nav:
+  - Home: index.md
+  - Tutorials:
+      - Tables: tutorials/tables.md
+      - Callbacks and runtime: tutorials/callbacks-runtime.md
+      - Async: tutorials/async.md
+      - Transport: tutorials/transport.md
+      - Store showcase: tutorials/showcase.md
+  - API model: api.md
+  - API reference: reference.md
+  - Async operation: async.md
+  - Lifecycle and caching: lifecycle.md
+  - Command line: cli.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.superfences
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true

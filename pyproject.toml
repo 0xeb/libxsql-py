@@ -1,0 +1,180 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "libxsql"
+version = "0.0.1"
+description = "Pythonic SQLite virtual tables, query execution, and transport utilities"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Human-Origin-Source-1.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
+authors = [
+    { name = "Elias Bachaalany", email = "elias.bachaalany@gmail.com" },
+]
+keywords = ["sqlite", "virtual-table", "database", "sql", "apsw"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Typing :: Typed",
+]
+dependencies = [
+    "anyio>=4.11,<5",
+    "apsw>=3.53.3.1,<4",
+]
+
+[project.optional-dependencies]
+thinclient = [
+    "httpx>=0.28,<1",
+    "hypercorn>=0.17,<1",
+]
+trio = [
+    "trio>=0.30,<1",
+]
+clipboard = [
+    "pyperclip>=1.9,<2",
+]
+all = [
+    "httpx>=0.28,<1",
+    "hypercorn>=0.17,<1",
+    "trio>=0.30,<1",
+    "pyperclip>=1.9,<2",
+]
+
+[project.scripts]
+libxsql = "libxsql.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/0xeb/libxsql-py#readme"
+Issues = "https://github.com/0xeb/libxsql-py/issues"
+Source = "https://github.com/0xeb/libxsql-py"
+
+[dependency-groups]
+dev = [
+    "build>=1.3,<2",
+    "check-wheel-contents>=0.6,<1",
+    "codespell>=2.4,<3",
+    "hypothesis>=6.138,<7",
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.6,<10",
+    "mkdocstrings[python]>=0.30,<1",
+    "mypy>=1.17,<2",
+    "pip-audit>=2.9,<3",
+    "pre-commit>=4.3,<5",
+    "pyright>=1.1.405,<2",
+    "pytest>=9.0.3,<10",
+    "pytest-cov>=6.2,<7",
+    "ruff>=0.14,<1",
+    "trio>=0.30,<1",
+    "twine>=6.2,<7",
+    "types-pyperclip>=1.9,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/libxsql"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/scripts",
+    "/examples",
+    "/docs",
+    "/LICENSE",
+    "/mkdocs.yml",
+    "/README.md",
+    "/THIRD_PARTY_NOTICES",
+    "/pyproject.toml",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "examples", "scripts"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "D203",
+    "D213",
+    "ISC001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/*.py" = ["INP001", "T201"]
+"scripts/*.py" = ["T201"]
+"src/libxsql/__main__.py" = ["T201"]
+# APSW adapters deliberately preserve BaseException/cancellation, use lazy
+# imports to break adapter cycles, and cooperate through private state.
+"src/libxsql/connection.py" = [
+    "ANN401",
+    "ASYNC109",
+    "BLE001",
+    "EM101",
+    "EM102",
+    "PLC0415",
+    "PLR0913",
+    "RSE102",
+    "SLF001",
+    "TRY003",
+]
+# Graph algorithms deliberately share compact adjacency storage within their
+# module; splitting textbook control flow would obscure the invariants.
+"src/libxsql/graph.py" = ["C901", "SLF001"]
+# SQLite mandates these callback spellings; the adapter's table/cursor objects
+# are one implementation unit even though APSW instantiates them separately.
+"src/libxsql/vtable.py" = ["N802", "SLF001"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+docstring-code-format = true
+line-ending = "lf"
+
+[tool.pyright]
+include = ["src", "examples", "scripts"]
+exclude = ["build", "dist"]
+pythonVersion = "3.11"
+pythonPlatform = "All"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = "error"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/libxsql", "examples", "scripts"]
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+
+[tool.codespell]
+skip = "*.lock,build,dist,site"
+quiet-level = 2
+
+[tool.coverage.run]
+branch = true
+source = ["libxsql"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 100
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "@overload",
+    "\\.\\.\\.",
+]

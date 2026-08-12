@@ -1,0 +1,105 @@
+schema_version = 1
+
+[[example]]
+name = "basic"
+script = "basic.py"
+summary = "Live product table, filtering, and aggregation"
+extras = []
+backends = ["sync"]
+reference = "examples/basic_table.cpp"
+
+[[example]]
+name = "async_basic"
+script = "async_basic.py"
+summary = "Basic AnyIO connection lifecycle"
+extras = ["trio"]
+backends = ["asyncio", "trio"]
+reference = ""
+
+[[example]]
+name = "cached_table"
+script = "cached_table.py"
+summary = "Query-scoped cache with an optimized equality filter"
+extras = []
+backends = ["sync"]
+reference = "examples/cached_table.cpp"
+
+[[example]]
+name = "cache_lifecycle"
+script = "cache_lifecycle.py"
+summary = "Shared snapshot reuse and explicit invalidation"
+extras = []
+backends = ["sync"]
+reference = ""
+
+[[example]]
+name = "generator_table"
+script = "generator_table.py"
+summary = "Lazy rows, hidden inputs, and LIMIT pushdown"
+extras = []
+backends = ["sync"]
+reference = ""
+
+[[example]]
+name = "writable_table"
+script = "writable_table.py"
+summary = "Updates, deletes, and modification hooks"
+extras = []
+backends = ["sync"]
+reference = "examples/writable_table.cpp"
+
+[[example]]
+name = "functions"
+script = "functions.py"
+summary = "Typed scalar and aggregate SQL callbacks"
+extras = []
+backends = ["sync"]
+reference = ""
+
+[[example]]
+name = "scripts_and_export"
+script = "scripts_and_export.py"
+summary = "Multi-statement execution and SQL export replay"
+extras = []
+backends = ["sync"]
+reference = ""
+
+[[example]]
+name = "runtime_settings"
+script = "runtime_settings.py"
+summary = "Runtime PRAGMA parsing and writable settings"
+extras = []
+backends = ["sync"]
+reference = ""
+
+[[example]]
+name = "graph_algorithms"
+script = "graph_algorithms.py"
+summary = "Dominators, natural loops, and components"
+extras = []
+backends = ["sync"]
+reference = ""
+
+[[example]]
+name = "async_tables"
+script = "async_tables.py"
+summary = "Async generator tables with asyncio and Trio"
+extras = ["trio"]
+backends = ["asyncio", "trio"]
+reference = ""
+
+[[example]]
+name = "http_round_trip"
+script = "http_round_trip.py"
+summary = "Loopback ASGI server and async thin client"
+extras = ["thinclient", "trio"]
+backends = ["asyncio", "trio"]
+reference = ""
+
+[[example]]
+name = "store_showcase"
+script = "store_showcase.py"
+summary = "End-to-end store workflow across the major APIs"
+extras = []
+backends = ["sync"]
+reference = ""

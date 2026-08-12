@@ -1,0 +1,43 @@
+libxsql for Python - Third-Party Notices
+========================================
+
+This project does not vendor third-party source code. Runtime dependencies are
+installed separately and remain governed by their own licenses.
+
+Required dependencies
+---------------------
+
+APSW
+  Copyright Roger Binns and APSW contributors.
+  APSW permits use under any OSI-approved open-source license. See the LICENSE
+  included with the installed APSW distribution and
+  https://github.com/rogerbinns/apsw.
+
+AnyIO
+  Copyright AnyIO contributors.
+  MIT License. See https://github.com/agronholm/anyio.
+
+SQLite
+  APSW links to SQLite. SQLite is dedicated to the public domain.
+  See https://sqlite.org/copyright.html.
+
+Optional dependencies
+---------------------
+
+HTTPX
+  Copyright Encode OSS Ltd.
+  BSD 3-Clause License. See https://github.com/encode/httpx.
+
+Hypercorn
+  Copyright Philip Jones and contributors.
+  MIT License. See https://github.com/pgjones/hypercorn.
+
+Trio
+  Copyright Trio contributors.
+  MIT License or Apache License 2.0. See https://github.com/python-trio/trio.
+
+Pyperclip
+  Copyright Al Sweigart.
+  BSD 3-Clause License. See https://github.com/asweigart/pyperclip.
+
+Consult the exact dependency version's installed metadata before redistribution.

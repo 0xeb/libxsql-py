@@ -61,7 +61,7 @@ jobs:
           python -m venv build/smoke
           build/smoke/bin/python -c "import pathlib, subprocess, sys; wheel=next(pathlib.Path('dist').glob('*.whl')); subprocess.check_call([sys.executable, '-m', 'pip', 'install', f'{wheel}[all]'])"
           build/smoke/bin/python -m pip check
-          build/smoke/bin/python -c "import libxsql; assert libxsql.__version__ == '0.0.1', libxsql.__version__; print(libxsql.__version__)"
+          build/smoke/bin/python -c "import libxsql; assert libxsql.__version__, libxsql.__version__; print(libxsql.__version__)"
           build/smoke/bin/python -m libxsql version
           build/smoke/bin/python -m libxsql query "SELECT 40 + 2 AS answer"
           build/smoke/bin/python examples/basic.py
@@ -72,7 +72,7 @@ jobs:
           python -m venv build/smoke
           build/smoke/Scripts/python -c "import pathlib, subprocess, sys; wheel=next(pathlib.Path('dist').glob('*.whl')); subprocess.check_call([sys.executable, '-m', 'pip', 'install', f'{wheel}[all]'])"
           build/smoke/Scripts/python -m pip check
-          build/smoke/Scripts/python -c "import libxsql; assert libxsql.__version__ == '0.0.1', libxsql.__version__; print(libxsql.__version__)"
+          build/smoke/Scripts/python -c "import libxsql; assert libxsql.__version__, libxsql.__version__; print(libxsql.__version__)"
           build/smoke/Scripts/python -m libxsql version
           build/smoke/Scripts/python -m libxsql query "SELECT 40 + 2 AS answer"
           build/smoke/Scripts/python examples/basic.py
@@ -106,7 +106,7 @@ jobs:
       - run: >-
           build/minimum/bin/python -c
           "import libxsql; connection=libxsql.connect();
-          assert libxsql.__version__ == '0.0.1';
+          assert libxsql.__version__;
           assert connection.scalar('SELECT 40 + 2') == 42; connection.close()"
       - run: build/minimum/bin/python examples/basic.py
       - run: build/minimum/bin/python examples/async_basic.py

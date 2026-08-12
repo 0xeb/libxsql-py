@@ -12,6 +12,5 @@ THIRD_PARTY_NOTICES text eol=lf
 py.typed text eol=lf
 
 /AGENTS.md export-ignore
-/.github export-ignore
 /.gitignore export-ignore
 /.pre-commit-config.yaml export-ignore

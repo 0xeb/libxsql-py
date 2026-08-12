@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling>=1.27,<1.28"]
 build-backend = "hatchling.build"
 
 [project]
 name = "libxsql"
-version = "0.0.1"
+version = "0.0.2"
 description = "Pythonic SQLite virtual tables, query execution, and transport utilities"
 readme = "README.md"
 requires-python = ">=3.11"

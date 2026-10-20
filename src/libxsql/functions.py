@@ -174,6 +174,21 @@ class FunctionContext:
             columns = tuple(str(item[0]) for item in description)
         return cursor, columns
 
+    def invalidate_cached_tables(self) -> None:
+        """Invalidate every table registered on this callback's connection.
+
+        Call it from a function that changes the data the tables read (renames,
+        re-analysis, redefined types): such a function is not a write through a
+        table and usually holds no :class:`~libxsql.Registration`. Each table is
+        invalidated exactly as a write through it would be, so a scan already in
+        flight keeps its rows while every later probe of the running statement,
+        and every later statement, rebuilds from the live source.
+        """
+        self._ensure_active()
+        from .vtable import invalidate_cached_tables  # noqa: PLC0415
+
+        invalidate_cached_tables(self._state.raw_connection)
+
     def _ensure_active(self) -> None:
         if not self._state.active:
             message = "function context is no longer active"

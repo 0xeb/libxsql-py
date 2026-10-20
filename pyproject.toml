@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "libxsql"
-version = "0.0.2"
+version = "0.0.3"
 description = "Pythonic SQLite virtual tables, query execution, and transport utilities"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,7 +41,7 @@ thinclient = [
     "hypercorn>=0.17,<1",
 ]
 trio = [
-    "trio>=0.30,<1",
+    "trio>=0.31,<1",
 ]
 clipboard = [
     "pyperclip>=1.9,<2",
@@ -49,7 +49,7 @@ clipboard = [
 all = [
     "httpx>=0.28,<1",
     "hypercorn>=0.17,<1",
-    "trio>=0.30,<1",
+    "trio>=0.31,<1",
     "pyperclip>=1.9,<2",
 ]
 
@@ -77,7 +77,7 @@ dev = [
     "pytest>=9.0.3,<10",
     "pytest-cov>=6.2,<7",
     "ruff>=0.14,<1",
-    "trio>=0.30,<1",
+    "trio>=0.31,<1",
     "twine>=6.2,<7",
     "types-pyperclip>=1.9,<2",
 ]

@@ -18,5 +18,6 @@ Long-running callback loops should cooperate with query interruption by polling
 
 Register a scalar callback with `with_context=True` when it needs a scoped
 nested lookup. Its first argument is a `FunctionContext`, which offers
-`query()`, `query_each()`, and `scalar()`. The context expires when the callback
+`query()`, `query_each()`, and `scalar()`, and `invalidate_cached_tables()` for
+a callback that mutates what the tables read. The context expires when the callback
 returns and cannot be retained or used as a general connection escape hatch.

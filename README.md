@@ -179,16 +179,30 @@ owner thread starts a request; a started mutation is allowed to finish and
 returns its real result. Queue saturation, admission expiry, and shutdown are
 reported distinctly as HTTP 503, 408, and 503.
 
+With a `streaming_executor` configured, a request carrying `X-XSQL-Stream: 1`
+(or `ndjson`) is answered row by row instead of buffered, with writes coalesced
+by `StreamWriteCoalescer`. `X-XSQL-Timeout` sets a per-request timeout,
+responses are gzip-compressed when the client accepts it, and a
+`cancel_handler` forwards `POST /cancel` downstream (a failure there is a 502,
+not a silent success).
+
 ## Table families
 
 - `table()` exposes live, index-addressable Python data.
 - `cached_table()` materializes an iterable for a query and supports indexed
   filtering. Query-scoped caching is the safe default; `.shared_cache()` is an
   explicit optimization. `.stateful_cache_builder()` receives isolated
-  registration state for transactional adapters.
+  registration state for transactional adapters. `.constraint_filter()` and
+  `.constraint_cache_filter()` consume several constraints at once, such as an
+  interval-containment join. Code that changes the data behind the tables
+  outside SQL calls `connection.invalidate_cached_tables()`, or
+  `context.invalidate_cached_tables()` from a `FunctionContext` callback: every
+  table on the connection is invalidated as a write through it would be.
 - `generator_table()` streams rows lazily and can consume query constraints,
-  projections, ordering, and limits. `.row_count()` makes bare `COUNT(*)`
-  constant-work without constructing or walking the generator.
+  projections, ordering, and limits. `.filter_like_text()` pushes down a
+  `LIKE`/`GLOB` pattern with a literal prefix, and the `*_projection` filters
+  tell the factory which columns the query reads. `.row_count()` makes bare
+  `COUNT(*)` constant-work without constructing or walking the generator.
 
 All families share generic `.column()`, `.filter()`, and `.index()` methods.
 Typed aliases such as `.column_int()` and `.filter_eq()` are conveniences, not
@@ -200,7 +214,8 @@ definition remains safe to reuse across connections. The legacy `.on_commit()`
 spelling remains available and maps to the fallible prepare phase.
 
 `RuntimeSettings` is a typed boolean/integer/string registry. Its canonical
-`runtime_settings(key, value, type, scope)` table stages `value` updates per
+`runtime_settings(key, value, type, scope, kind, settable)` table stages
+`value` updates per
 connection and honors statement atomicity, read-your-writes, commit, rollback,
 and savepoints. Only the imperative `timeout_push` and `timeout_pop` operations
 remain PRAGMAs. `define_sql_capabilities()` builds the sorted, read-only

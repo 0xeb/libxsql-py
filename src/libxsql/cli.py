@@ -168,8 +168,8 @@ def _serve_command(arguments: argparse.Namespace) -> int:
     )
     server = HttpQueryServer(config)
     try:
-        port = server.start()
-        sys.stdout.write(f"http://{config.bind_address}:{port}\n")
+        server.start()
+        sys.stdout.write(f"{server.url}\n")
         sys.stdout.flush()
         server.run_until_stopped()
     except KeyboardInterrupt:

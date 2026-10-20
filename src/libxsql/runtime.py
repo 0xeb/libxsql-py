@@ -69,12 +69,19 @@ class RuntimeSettingSpec:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeSettingEntry:
-    """One row in the canonical ``runtime_settings`` discovery table."""
+    """One row in the canonical ``runtime_settings`` discovery table.
+
+    ``kind`` and ``settable`` exist because ``scope`` cannot answer "may I
+    change this?": ``query_timeout_ms`` (tunable) and
+    ``max_timeout_stack_depth`` (a read-only live counter) are both ``common``.
+    """
 
     key: str
     value: str
     value_type: str
     scope: str
+    kind: str = "value"
+    settable: int = 0
 
     @property
     def type(self) -> str:
@@ -113,6 +120,9 @@ class _SettingRecord:
 class _RuntimeSettingsTableRow:
     entry: RuntimeSettingEntry
     connection_state: object
+    # The row's rowid: its position in the settings enumeration, which is also
+    # the key the table's row lookup resolves.
+    ordinal: int
 
     @property
     def key(self) -> str:
@@ -133,6 +143,14 @@ class _RuntimeSettingsTableRow:
     @property
     def scope(self) -> str:
         return self.entry.scope
+
+    @property
+    def kind(self) -> str:
+        return self.entry.kind
+
+    @property
+    def settable(self) -> int:
+        return self.entry.settable
 
 
 class RuntimeSettings:
@@ -403,6 +421,13 @@ class RuntimeSettings:
                     self._effective_value_locked(key),
                     self._settings[key].spec.setting_type.value,
                     self._settings[key].spec.scope,
+                    # An action row is never settable even if registered
+                    # writable: the timeout verbs are actions, not values.
+                    "action" if self._settings[key].spec.scope == "action" else "value",
+                    int(
+                        self._settings[key].spec.writable
+                        and self._settings[key].spec.scope != "action"
+                    ),
                 )
                 for key in self._order
             )
@@ -803,8 +828,9 @@ def define_runtime_settings_table(  # noqa: C901, PLR0915 - one cohesive adapter
                     value=transaction.staged.get(entry.key, entry.value),
                 ),
                 state,
+                ordinal,
             )
-            for entry in settings.enumerate()
+            for ordinal, entry in enumerate(settings.enumerate())
         )
 
     def restore_statement(transaction: _RuntimeSettingsTransaction) -> None:
@@ -939,15 +965,20 @@ def define_runtime_settings_table(  # noqa: C901, PLR0915 - one cohesive adapter
         cached_table("runtime_settings")
         .estimate_rows(lambda: len(settings.specs()))
         .stateful_cache_builder(rows_for_state)
+        .rowid(lambda row: row.ordinal)
         .stateful_row_lookup(row_lookup)
         .transaction_hooks(hooks)
+        # Session settings, not host data: an UPDATE here is not a host write.
+        .counts_as_write(enabled=False)
         .column("key", str, attr="key")
         .column("value", str, attr="value", set=set_value, nullable=True)
         .column("type", str, attr="value_type")
         .column("scope", str, attr="scope")
+        .column("kind", str, attr="kind")
+        .column("settable", int, attr="settable")
         .build()
     )
-    # The public row type is the immutable four-field discovery value. The
+    # The public row type is the immutable discovery value. The
     # virtual-table adapter carries connection-local transaction state in a
     # private wrapper that never escapes through ``RuntimeSettings.enumerate``.
     return cast("TableDefinition[RuntimeSettingEntry]", definition)

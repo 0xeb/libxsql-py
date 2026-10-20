@@ -8,6 +8,7 @@ import csv
 import inspect
 import io
 import json
+import math
 import os
 import tempfile
 import time
@@ -19,7 +20,13 @@ from typing import TYPE_CHECKING, Any, cast
 import apsw
 from anyio import to_thread
 
-from .errors import LibxsqlError, PartialQueryError, QueryCancelledError, QueryTimeoutError
+from .errors import (
+    FullScanError,
+    LibxsqlError,
+    PartialQueryError,
+    QueryCancelledError,
+    QueryTimeoutError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Iterator
@@ -385,10 +392,22 @@ def export_tables(
 
     An empty ``tables`` iterable exports every ordinary table in ``main``.
     Identifiers are always quoted and values are emitted as typed SQL literals.
+    The header's ``-- Tables: N`` counts the tables actually written.
+
+    A table that cannot be read without constraints (a virtual table needing a
+    ``WHERE``: a required constraint, or a forbidden full scan) is skipped when
+    exporting every table and named on a
+    ``-- Skipped (requires constraints): a, b`` line. Requested by name, it
+    raises :class:`FullScanError` with ``Table 'a' cannot be exported: it
+    requires constraints (WHERE) to be read (<the table's reason>)``. Any other
+    error propagates. A failed export leaves ``output_path`` untouched.
     """
     effective_options = options or ExportOptions()
-    names = _sync_table_names(connection, tables)
-    text = _render_export_sync(connection, names, effective_options)
+    requested = tuple(tables)
+    names = requested or _sync_table_names(connection)
+    text = _render_export_sync(
+        connection, names, effective_options, explicit_request=bool(requested)
+    )
     return _write_export(output_path, text)
 
 
@@ -398,7 +417,11 @@ async def export_tables_async(
     output_path: str | os.PathLike[str],
     options: ExportOptions | None = None,
 ) -> Path:
-    """Asynchronously export tables without blocking the event loop on file I/O."""
+    """Asynchronously export tables without blocking the event loop on file I/O.
+
+    Tables that require constraints are skipped or refused exactly as in
+    :func:`export_tables`.
+    """
     effective_options = options or ExportOptions()
     requested = tuple(tables)
     if requested:
@@ -408,31 +431,26 @@ async def export_tables_async(
             "SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name"
         )
         names = tuple(str(row[0]) for row in result.rows)
-    chunks = _export_header(names, effective_options)
+    export = _ExportBuilder(effective_options, explicit_request=bool(requested))
     for name in names:
         quoted_name = quote_identifier(name)
         column_result = await connection.query(f"PRAGMA table_info({quoted_name})")
         columns = _columns_from_rows(column_result.rows)
         if not columns:
             continue
-        rows = (
-            (await connection.query(f"SELECT * FROM {quoted_name}")).rows  # noqa: S608
-            if effective_options.include_data
-            else ()
-        )
-        chunks.extend(_render_export_table(name, columns, rows, effective_options))
-    chunks.extend(_export_footer(effective_options))
-    text = "".join(chunks)
+        rows: Iterable[SQLiteRow] = ()
+        if effective_options.include_data:
+            try:
+                rows = (await connection.query(f"SELECT * FROM {quoted_name}")).rows  # noqa: S608
+            except (FullScanError, apsw.ConstraintError, apsw.SQLError) as error:
+                export.refuse(name, error)
+                continue
+        export.add(name, columns, rows)
+    text = export.render()
     return await to_thread.run_sync(_write_export, output_path, text)
 
 
-def _sync_table_names(
-    connection: Connection,
-    tables: Iterable[str],
-) -> tuple[str, ...]:
-    requested = tuple(tables)
-    if requested:
-        return requested
+def _sync_table_names(connection: Connection) -> tuple[str, ...]:
     result = connection.query(
         "SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name"
     )
@@ -443,21 +461,97 @@ def _render_export_sync(
     connection: Connection,
     names: tuple[str, ...],
     options: ExportOptions,
+    *,
+    explicit_request: bool,
 ) -> str:
-    chunks = _export_header(names, options)
+    export = _ExportBuilder(options, explicit_request=explicit_request)
     for name in names:
         quoted_name = quote_identifier(name)
         columns = _columns_from_rows(connection.query(f"PRAGMA table_info({quoted_name})").rows)
         if not columns:
             continue
-        rows = (
-            connection.query(f"SELECT * FROM {quoted_name}").rows  # noqa: S608
-            if options.include_data
-            else ()
-        )
-        chunks.extend(_render_export_table(name, columns, rows, options))
-    chunks.extend(_export_footer(options))
-    return "".join(chunks)
+        rows: Iterable[SQLiteRow] = ()
+        if options.include_data:
+            try:
+                rows = connection.query(f"SELECT * FROM {quoted_name}").rows  # noqa: S608
+            except (FullScanError, apsw.ConstraintError, apsw.SQLError) as error:
+                export.refuse(name, error)
+                continue
+        export.add(name, columns, rows)
+    return export.render()
+
+
+# SQLite's planner text when every plan a virtual table offered was refused
+# (its xBestIndex reported SQLITE_CONSTRAINT for each one).
+_NO_QUERY_SOLUTION = "no query solution"
+
+
+def _refusal_reason(error: Exception) -> str | None:
+    """The table's reason when ``error`` means it cannot be read without constraints.
+
+    A libxsql table refuses an unconstrained scan with :class:`FullScanError`; a
+    raw module can signal an explicit ``SQLITE_CONSTRAINT_VTAB`` refusal, and a
+    planner rejecting every plan fails with "no query solution". Ordinary
+    backend constraint errors propagate.
+    """
+    if isinstance(error, FullScanError):
+        return str(error)
+    if (
+        isinstance(error, apsw.ConstraintError)
+        and getattr(error, "extendedresult", None) == apsw.SQLITE_CONSTRAINT_VTAB
+    ):
+        return str(error)
+    if str(error) == _NO_QUERY_SOLUTION:
+        return _NO_QUERY_SOLUTION
+    return None
+
+
+class _ExportBuilder:
+    """Collects table sections; the header is rendered last to count them honestly."""
+
+    def __init__(self, options: ExportOptions, *, explicit_request: bool) -> None:
+        self.options = options
+        self.explicit_request = explicit_request
+        self.sections: list[str] = []
+        self.exported = 0
+        self.skipped: list[str] = []
+
+    def add(
+        self,
+        name: str,
+        columns: tuple[_ColumnInfo, ...],
+        rows: Iterable[SQLiteRow],
+    ) -> None:
+        self.sections.extend(_render_export_table(name, columns, rows, self.options))
+        self.exported += 1
+
+    def refuse(self, name: str, error: Exception) -> None:
+        """Skip ``name`` (all-tables export) or fail (requested by name); re-raise others."""
+        reason = _refusal_reason(error)
+        if reason is None:
+            raise error
+        if self.explicit_request:
+            message = (
+                f"Table '{name}' cannot be exported: it requires constraints (WHERE) to be read"
+            )
+            if reason:
+                message += f" ({reason})"
+            raise FullScanError(message) from error
+        self.skipped.append(name)
+
+    def render(self) -> str:
+        chunks: list[str] = []
+        if self.options.include_header:
+            chunks.extend(("-- SQL Export\n", f"-- Tables: {self.exported}\n"))
+        if self.skipped:
+            chunks.append(f"-- Skipped (requires constraints): {', '.join(self.skipped)}\n")
+        if chunks:
+            chunks.append("\n")
+        if self.options.wrap_transaction:
+            chunks.extend(("BEGIN TRANSACTION;\n", "\n"))
+        chunks.extend(self.sections)
+        chunks.extend(_export_footer(self.options))
+        return "".join(chunks)
 
 
 def _columns_from_rows(rows: Iterable[SQLiteRow]) -> tuple[_ColumnInfo, ...]:
@@ -472,15 +566,6 @@ def _columns_from_rows(rows: Iterable[SQLiteRow]) -> tuple[_ColumnInfo, ...]:
         for row in rows
         if len(row) >= _TABLE_INFO_COLUMN_COUNT
     )
-
-
-def _export_header(names: tuple[str, ...], options: ExportOptions) -> list[str]:
-    chunks: list[str] = []
-    if options.include_header:
-        chunks.extend(("-- SQL Export\n", f"-- Tables: {len(names)}\n", "\n"))
-    if options.wrap_transaction:
-        chunks.extend(("BEGIN TRANSACTION;\n", "\n"))
-    return chunks
 
 
 def _export_footer(options: ExportOptions) -> tuple[str, ...]:
@@ -528,9 +613,13 @@ def _sql_literal(value: SQLiteValue) -> str:
     if isinstance(value, bytes):
         return f"X'{value.hex().upper()}'"
     if isinstance(value, str):
+        if "\0" in value:
+            return f"CAST(X'{value.encode('utf-8').hex().upper()}' AS TEXT)"
         return "'" + value.replace("'", "''") + "'"
     if isinstance(value, float):
-        return format(value, ".16g")
+        return (
+            ("-9.0e999" if value < 0 else "9.0e999") if math.isinf(value) else format(value, ".16e")
+        )
     return str(value)
 
 

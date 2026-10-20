@@ -122,6 +122,7 @@ from .thinclient import (
     HttpQueryServerConfig,
     HttpRequest,
     HttpResponse,
+    StreamWriteCoalescer,
     ThinClient,
 )
 from .types import (
@@ -147,6 +148,7 @@ from .vtable import (
     GeneratorTableBuilder,
     GeneratorTableBuilderStart,
     Index,
+    Int64KeyRange,
     OrderTerm,
     Projection,
     Registration,
@@ -154,7 +156,10 @@ from .vtable import (
     TableDefinition,
     TableKind,
     TransactionHooks,
+    U64Span,
     cached_table,
+    exact_int64,
+    exact_text,
     generator_table,
     optional,
     optional_eq,
@@ -176,7 +181,7 @@ from .vtable import (
 try:
     __version__ = version("libxsql")
 except PackageNotFoundError:
-    __version__ = "0.0.2"
+    __version__ = "0.0.3"
 
 
 __all__ = [
@@ -223,6 +228,7 @@ __all__ = [
     "HttpRequest",
     "HttpResponse",
     "Index",
+    "Int64KeyRange",
     "LibxsqlError",
     "NaturalLoop",
     "OrderTerm",
@@ -255,6 +261,7 @@ __all__ = [
     "ScriptStatementResult",
     "SqlCapability",
     "StatementResult",
+    "StreamWriteCoalescer",
     "TableBuilder",
     "TableDefinition",
     "TableKind",
@@ -264,6 +271,7 @@ __all__ = [
     "ThreadingError",
     "Transaction",
     "TransactionHooks",
+    "U64Span",
     "UnsupportedRuntimeError",
     "__version__",
     "aggregate",
@@ -275,6 +283,8 @@ __all__ = [
     "define_runtime_settings_table",
     "define_sql_capabilities",
     "dominator_sets",
+    "exact_int64",
+    "exact_text",
     "execute_script",
     "export_tables",
     "export_tables_async",

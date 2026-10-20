@@ -24,7 +24,7 @@ import operator
 import threading
 import uuid
 import weakref
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 from collections.abc import (
     AsyncIterable,
     AsyncIterator,
@@ -88,6 +88,11 @@ RowLookup: TypeAlias = Callable[[int], RowT | None]
 StatefulRowLookup: TypeAlias = Callable[[object, int], RowT | None]
 FilterFactory: TypeAlias = Callable[[SQLiteValue], SourceResult[RowT]]
 ConstraintFactory: TypeAlias = Callable[[tuple["Constraint", ...]], SourceResult[RowT]]
+ProjectionFilterFactory: TypeAlias = Callable[[SQLiteValue, "Projection"], SourceResult[RowT]]
+ProjectionConstraintFactory: TypeAlias = Callable[
+    [tuple["Constraint", ...], "Projection"],
+    SourceResult[RowT],
+]
 CountCallback: TypeAlias = Callable[[], int]
 EstimateCallback: TypeAlias = Callable[[], int]
 ModifyHook: TypeAlias = Callable[[str], None]
@@ -96,18 +101,23 @@ TransactionStateFactory: TypeAlias = Callable[[], object]
 TransactionPrepareHook: TypeAlias = Callable[[object], None]
 TransactionFinalHook: TypeAlias = Callable[[object], None]
 TransactionSavepointHook: TypeAlias = Callable[[object, int], None]
-IndexDeleteCallback: TypeAlias = Callable[[int], bool | None]
 RowDeleteCallback: TypeAlias = Callable[[RowT], bool | None]
 InsertCallback: TypeAlias = Callable[[Mapping[str, SQLiteValue]], int | bool | None]
-UpdateCallback: TypeAlias = Callable[[int, Mapping[str, SQLiteValue]], bool | None]
+UpdateCallback: TypeAlias = Callable[[RowT, Mapping[str, SQLiteValue]], bool | None]
 AsyncRunner: TypeAlias = Callable[[Any], Any]
 AwaitableScope: TypeAlias = Callable[[Awaitable[object]], Awaitable[object]]
 InterruptChecker: TypeAlias = Callable[[], bool]
 
 _MIN_ROWID: Final = -(1 << 63)
 _MAX_ROWID: Final = (1 << 63) - 1
+_U64_MAX: Final = (1 << 64) - 1
 _DEFAULT_ESTIMATED_ROWS: Final = 1_000_000
 _DEFAULT_ESTIMATED_COST: Final = 1_000_000.0
+# A plan that can only refuse the query must be the one SQLite picks last: in a
+# join it competes with plans where another table runs outer and feeds the
+# required value in per row. Priced cheap it won, and a valid join failed.
+# Alone it is still the only plan, so the refusal stands. (Same as the C++ core.)
+_REJECT_COST: Final = 1e9
 
 
 class _SupportsGetItem(Protocol):
@@ -152,6 +162,15 @@ class ConstraintOp(IntEnum):
     LIMIT = apsw.SQLITE_INDEX_CONSTRAINT_LIMIT
     OFFSET = apsw.SQLITE_INDEX_CONSTRAINT_OFFSET
     FUNCTION = apsw.SQLITE_INDEX_CONSTRAINT_FUNCTION
+
+
+# Operators a cache-backed constraint filter can evaluate against an index key.
+_CACHE_FILTER_OPS: Final = frozenset(
+    {ConstraintOp.EQ, ConstraintOp.GT, ConstraintOp.GE, ConstraintOp.LT, ConstraintOp.LE},
+)
+# A LIKE/GLOB pattern starting with one of these gives a filter nothing to seek on.
+_LIKE_UNUSABLE_LEADS: Final = frozenset("%_\\")
+_PATTERN_OPS: Final = frozenset({ConstraintOp.LIKE, ConstraintOp.GLOB})
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,25 +280,37 @@ class Index(Generic[RowT]):
 
 @dataclass(frozen=True, slots=True)
 class Filter(Generic[RowT]):
-    """A single-constraint source factory."""
+    """A single-constraint source factory.
+
+    With ``projection`` set, ``factory`` also receives the scan's
+    :class:`Projection`, so it can skip columns the query never reads.
+    """
 
     column: str
     op: ConstraintOp
-    factory: FilterFactory[RowT]
+    factory: FilterFactory[RowT] | ProjectionFilterFactory[RowT]
     estimated_cost: float
     estimated_rows: int
     exact: bool
+    projection: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ConstraintFilter(Generic[RowT]):
-    """A multi-constraint generator source factory."""
+    """A multi-constraint source factory.
+
+    With ``projection`` set, ``factory`` also receives the scan's
+    :class:`Projection`. A ``factory`` of ``None`` evaluates the matched
+    constraints in memory against a cached table's materialized rows, comparing
+    each column through its :meth:`CachedTableBuilder.index` key.
+    """
 
     specs: tuple[ConstraintSpec, ...]
-    factory: ConstraintFactory[RowT]
+    factory: ConstraintFactory[RowT] | ProjectionConstraintFactory[RowT] | None
     estimated_cost: float
     estimated_rows: int
     order_by: tuple[OrderTerm, ...] = ()
+    projection: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,11 +336,12 @@ class TableDefinition(Generic[RowT]):
     before_modify: ModifyHook | None = None
     after_modify: ModifyHook | None = None
     transaction_hooks: TransactionHooks = TransactionHooks()
-    delete_row: IndexDeleteCallback | RowDeleteCallback[RowT] | None = None
+    delete_row: RowDeleteCallback[RowT] | None = None
     insert_row: InsertCallback | None = None
-    update_row: UpdateCallback | None = None
+    update_row: UpdateCallback[RowT] | None = None
     full_scan_message: str | None = None
     shared: bool = False
+    counts_as_write: bool = True
 
     @property
     def schema(self) -> str:
@@ -451,11 +483,12 @@ class _BaseTableBuilder(Generic[RowT]):
         self._before_modify: ModifyHook | None = None
         self._after_modify: ModifyHook | None = None
         self._transaction_hooks = TransactionHooks()
-        self._delete_row: IndexDeleteCallback | RowDeleteCallback[RowT] | None = None
+        self._delete_row: RowDeleteCallback[RowT] | None = None
         self._insert_row: InsertCallback | None = None
-        self._update_row: UpdateCallback | None = None
+        self._update_row: UpdateCallback[RowT] | None = None
         self._full_scan_message: str | None = None
         self._shared = False
+        self._counts_as_write = True
 
     def _copy_state_to(self, target: _BaseTableBuilder[SourceRowT]) -> None:
         """Copy fluent state into a freshly row-typed builder."""
@@ -498,17 +531,36 @@ class _BaseTableBuilder(Generic[RowT]):
         return self
 
     def rowid(self, callback: RowidGetter[RowT]) -> Self:
-        """Set a stable rowid getter."""
+        """Set a stable rowid getter.
+
+        The rowid is then a KEY, not a scan position: every plan reports it and
+        ``WHERE rowid = ?`` matches it. On a cached or generator table it may be
+        negative (an address at or above ``2**63``). A cached table with
+        :meth:`row_lookup` or :meth:`stateful_row_lookup` must set it, returning
+        exactly the key those callbacks resolve; a live table that sets it and
+        is updatable or deletable must resolve its keys with a row lookup.
+        """
         self._rowid = callback
         return self
 
     def row_lookup(self, callback: RowLookup[RowT]) -> Self:
-        """Set stable row reconstruction by rowid for mutation."""
+        """Resolve a rowid (a KEY, never a position) back to its row for mutation.
+
+        On a cached table this is the SOLE authority for UPDATE, DELETE and
+        ``WHERE rowid = ?``: a rowid it returns ``None`` for fails the write with
+        ``row <id> not found in <table>`` and matches no row on read, never
+        another row by position. A cached table that sets it must also set
+        :meth:`rowid`; building or registering one without it raises
+        :class:`ConfigurationError`.
+        """
         self._row_lookup = callback
         return self
 
     def stateful_row_lookup(self, callback: StatefulRowLookup[RowT]) -> Self:
-        """Set row reconstruction receiving registration transaction state."""
+        """Like :meth:`row_lookup`, also receiving registration transaction state.
+
+        The same row-identity rule applies: a cached table needs :meth:`rowid`.
+        """
         self._stateful_row_lookup = callback
         return self
 
@@ -551,13 +603,29 @@ class _BaseTableBuilder(Generic[RowT]):
         self._transaction_hooks = hooks
         return self
 
+    def counts_as_write(self, *, enabled: bool = True) -> Self:
+        """Choose whether this table's row writes count in ``vtab_write_count``.
+
+        Tables count by default. A session or bookkeeping table (settings,
+        checkpoints, previews) passes ``enabled=False`` so writing it does not
+        read as a change to the host.
+        """
+        self._counts_as_write = enabled
+        return self
+
     def insertable(self, callback: InsertCallback) -> Self:
         """Enable insertion from a name-to-value mapping."""
         self._insert_row = callback
         return self
 
-    def updatable(self, callback: UpdateCallback) -> Self:
-        """Enable preferred atomic row updates."""
+    def updatable(self, callback: UpdateCallback[RowT]) -> Self:
+        """Enable preferred atomic row updates.
+
+        ``callback(row, changes)`` receives the row the UPDATE's rowid resolves
+        to -- the same row the column setters would receive -- and a mapping of
+        only the columns the statement changed. A rowid that resolves to no row
+        fails the statement before the callback runs.
+        """
         self._update_row = callback
         return self
 
@@ -800,6 +868,27 @@ class _BaseTableBuilder(Generic[RowT]):
         exact: bool | None = None,
     ) -> Self:
         """Add a source optimized for one SQLite constraint."""
+        return self._append_filter(
+            column,
+            op,
+            factory,
+            estimated_cost=estimated_cost,
+            estimated_rows=estimated_rows,
+            exact=exact,
+            projection=False,
+        )
+
+    def _append_filter(  # noqa: PLR0913 - one row of the filter table.
+        self,
+        column: str,
+        op: ConstraintOp,
+        factory: FilterFactory[RowT] | ProjectionFilterFactory[RowT],
+        *,
+        estimated_cost: float,
+        estimated_rows: int,
+        exact: bool | None,
+        projection: bool,
+    ) -> Self:
         _validate_cost(estimated_cost)
         _validate_count(estimated_rows, "estimated rows")
         if exact is None:
@@ -813,7 +902,15 @@ class _BaseTableBuilder(Generic[RowT]):
                 ConstraintOp.IS_NULL,
             }
         self._filters.append(
-            Filter(column, ConstraintOp(op), factory, estimated_cost, estimated_rows, exact),
+            Filter(
+                column,
+                ConstraintOp(op),
+                factory,
+                estimated_cost,
+                estimated_rows,
+                exact,
+                projection,
+            ),
         )
         return self
 
@@ -930,23 +1027,25 @@ class _BaseTableBuilder(Generic[RowT]):
                 "cached_table(..., source) or cache_builder()"
             )
             raise ConfigurationError(msg)
+        writable = (
+            self._delete_row is not None
+            or self._update_row is not None
+            or any(column.writable for column in self._columns)
+        )
         if (
             self._kind is TableKind.GENERATOR
-            and (self._delete_row is not None or any(column.writable for column in self._columns))
+            and writable
             and self._row_lookup is None
             and self._stateful_row_lookup is None
         ):
             msg = "writable generator tables require row_lookup()"
             raise ConfigurationError(msg)
-        if (
-            self._filters
-            and self._rowid is None
-            and (
-                self._delete_row is not None
-                or self._update_row is not None
-                or any(column.writable for column in self._columns)
-            )
-        ):
+        # A filter factory's rows carry positions in the factory's output, not
+        # in the table, so only a rowid() key can name them for a write.
+        factory_filters = self._filters or any(
+            constraint_filter.factory is not None for constraint_filter in self._constraint_filters
+        )
+        if factory_filters and self._rowid is None and writable:
             msg = "writable filtered tables require rowid()"
             raise ConfigurationError(msg)
         if self._source is not None and not callable(self._source):
@@ -957,7 +1056,7 @@ class _BaseTableBuilder(Generic[RowT]):
 
     def _definition(self) -> TableDefinition[RowT]:
         self._validate()
-        return TableDefinition(
+        definition = TableDefinition(
             name=self._name,
             kind=self._kind,
             columns=tuple(self._columns),
@@ -982,14 +1081,26 @@ class _BaseTableBuilder(Generic[RowT]):
             update_row=self._update_row,
             full_scan_message=self._full_scan_message,
             shared=self._shared,
+            counts_as_write=self._counts_as_write,
         )
+        _require_row_identity(definition)
+        return definition
 
 
 class TableBuilder(_BaseTableBuilder[RowT]):
     """Fluent builder for a live sequence/index virtual table."""
 
-    def deletable(self, callback: IndexDeleteCallback) -> Self:
-        """Enable deletion by positional rowid."""
+    def deletable(self, callback: RowDeleteCallback[RowT]) -> Self:
+        """Enable deletion of the row the rowid resolves to.
+
+        Without :meth:`rowid` the rowid is the position the statement scanned
+        the row at, resolved through :meth:`row_at` or the row sequence; a
+        multi-row DELETE reads it at the position minus the rows the statement
+        already deleted before it, so a callback that removes its row from the
+        sequence still receives exactly the rows the statement matched. With
+        :meth:`rowid`, the rowid resolves through the row lookup. The callback
+        receives that row, as the column setters do.
+        """
         self._delete_row = callback
         return self
 
@@ -1020,6 +1131,82 @@ class CachedTableBuilder(_BaseTableBuilder[RowT]):
         """Persist complete rows from the full source until invalidation."""
         self._shared = enabled
         return self
+
+    def constraint_filter(
+        self,
+        specs: Iterable[ConstraintSpec],
+        factory: ConstraintFactory[RowT],
+        *,
+        estimated_cost: float = 1.0,
+        estimated_rows: int = 100,
+    ) -> Self:
+        """Add an exact multi-column/operator pushdown backed by ``factory``.
+
+        Every required constraint must be usable before SQLite selects the
+        plan. ``factory`` receives the matched constraints in declaration order
+        and must return exactly the rows satisfying all of them. This covers
+        relations a single-column filter or :meth:`index` cannot express, such
+        as interval containment. Misconfiguration raises immediately instead of
+        silently leaving the table without the pushdown.
+        """
+        normalized = _normalized_constraint_specs(specs, "constraint_filter")
+        for spec in normalized:
+            self._require_column(spec.column, "constraint_filter")
+        self._constraint_filters.append(
+            ConstraintFilter(
+                specs=normalized,
+                factory=factory,
+                estimated_cost=_validate_cost(estimated_cost),
+                estimated_rows=_validate_count(estimated_rows, "estimated rows"),
+            ),
+        )
+        return self
+
+    def constraint_cache_filter(
+        self,
+        specs: Iterable[ConstraintSpec],
+        *,
+        estimated_cost: float = 1.0,
+        estimated_rows: int = 100,
+    ) -> Self:
+        """Add an exact multi-column/operator filter evaluated over the cached rows.
+
+        Every referenced column must also be registered with :meth:`index`,
+        whose key supplies the comparison value; only ``=``, ``<``, ``<=``,
+        ``>`` and ``>=`` can be evaluated that way. It serves both caching
+        models: a :meth:`shared_cache` table evaluates against its shared rows,
+        any other table against rows materialized once per scan.
+        """
+        normalized = _normalized_constraint_specs(specs, "constraint_cache_filter")
+        indexed = {index.column for index in self._indexes}
+        for spec in normalized:
+            self._require_column(spec.column, "constraint_cache_filter")
+            if spec.column not in indexed:
+                msg = (
+                    f"constraint_cache_filter on table {self._name!r}: column "
+                    f"{spec.column!r} needs a matching index() to supply its comparison value"
+                )
+                raise ConfigurationError(msg)
+            if spec.op not in _CACHE_FILTER_OPS:
+                msg = (
+                    f"constraint_cache_filter on table {self._name!r}: {spec.op.name} is not "
+                    f"evaluable against an index key (column {spec.column!r})"
+                )
+                raise ConfigurationError(msg)
+        self._constraint_filters.append(
+            ConstraintFilter(
+                specs=normalized,
+                factory=None,
+                estimated_cost=_validate_cost(estimated_cost),
+                estimated_rows=_validate_count(estimated_rows, "estimated rows"),
+            ),
+        )
+        return self
+
+    def _require_column(self, name: str, api: str) -> None:
+        if not any(column.name == name for column in self._columns):
+            msg = f"{api} on table {self._name!r}: unknown column {name!r}"
+            raise ConfigurationError(msg)
 
     def deletable(self, callback: RowDeleteCallback[RowT]) -> Self:
         """Enable deletion after resolving the target row."""
@@ -1117,24 +1304,85 @@ class GeneratorTableBuilder(_BaseTableBuilder[RowT]):
         estimated_rows: int = 1,
     ) -> Self:
         """Add a multi-constraint generator plan."""
-        normalized = tuple(specs)
-        if not normalized:
-            msg = "constraint_filter requires at least one constraint"
-            raise ConfigurationError(msg)
-        if len({(spec.column, spec.op) for spec in normalized}) != len(normalized):
-            msg = "constraint_filter contains duplicate column/operator pairs"
-            raise ConfigurationError(msg)
-        _validate_cost(estimated_cost)
-        _validate_count(estimated_rows, "estimated rows")
         self._constraint_filters.append(
             ConstraintFilter(
-                specs=normalized,
+                specs=_normalized_constraint_specs(specs, "constraint_filter"),
                 factory=factory,
-                estimated_cost=estimated_cost,
-                estimated_rows=estimated_rows,
+                estimated_cost=_validate_cost(estimated_cost),
+                estimated_rows=_validate_count(estimated_rows, "estimated rows"),
             ),
         )
         return self
+
+    def constraint_filter_projection(
+        self,
+        specs: Iterable[ConstraintSpec],
+        factory: ProjectionConstraintFactory[RowT],
+        *,
+        estimated_cost: float = 1.0,
+        estimated_rows: int = 1,
+    ) -> Self:
+        """Add a multi-constraint plan whose factory also receives the projection.
+
+        Like :meth:`constraint_filter`, but ``factory`` is called as
+        ``factory(constraints, projection)``, so a pushdown can skip an
+        expensive column the query never reads.
+        """
+        self._constraint_filters.append(
+            ConstraintFilter(
+                specs=_normalized_constraint_specs(specs, "constraint_filter_projection"),
+                factory=factory,
+                estimated_cost=_validate_cost(estimated_cost),
+                estimated_rows=_validate_count(estimated_rows, "estimated rows"),
+                projection=True,
+            ),
+        )
+        return self
+
+    def filter_eq_projection(
+        self,
+        column: str,
+        factory: ProjectionFilterFactory[RowT],
+        estimated_cost: float = 10.0,
+        estimated_rows: int = 10,
+    ) -> Self:
+        """Add an exact equality filter whose factory also receives the projection."""
+        return self._append_filter(
+            column,
+            ConstraintOp.EQ,
+            factory,
+            estimated_cost=estimated_cost,
+            estimated_rows=estimated_rows,
+            exact=True,
+            projection=True,
+        )
+
+    def filter_like_text(
+        self,
+        column: str,
+        factory: Callable[[str, Projection], SourceResult[RowT]],
+        estimated_cost: float = 10.0,
+        estimated_rows: int = 1000,
+    ) -> Self:
+        """Add a ``LIKE`` superset filter receiving the raw pattern and the projection.
+
+        The plan is used only when the pattern has a usable literal prefix (a
+        leading wildcard falls back to the full scan), and SQLite always
+        re-checks the real pattern, so ``factory`` may return a superset.
+        """
+
+        def adapt(value: SQLiteValue, projection: Projection) -> SourceResult[RowT]:
+            return factory(_sqlite_text(value), projection)
+
+        return self._append_filter(
+            column,
+            ConstraintOp.LIKE,
+            adapt,
+            estimated_cost=estimated_cost,
+            estimated_rows=estimated_rows,
+            exact=False,
+            projection=True,
+        )
 
     def parametric_filter(
         self,
@@ -1158,6 +1406,30 @@ class GeneratorTableBuilder(_BaseTableBuilder[RowT]):
             estimated_rows=estimated_rows,
         )
 
+    def parametric_filter_projection(
+        self,
+        columns: Iterable[str],
+        factory: Callable[[tuple[SQLiteValue, ...], Projection], SourceResult[RowT]],
+        *,
+        estimated_cost: float = 1.0,
+        estimated_rows: int = 1,
+    ) -> Self:
+        """Add a :meth:`parametric_filter` whose factory also receives the projection."""
+        specs = tuple(required_eq(name) for name in columns)
+
+        def adapt(
+            constraints: tuple[Constraint, ...],
+            projection: Projection,
+        ) -> SourceResult[RowT]:
+            return factory(tuple(constraint.value for constraint in constraints), projection)
+
+        return self.constraint_filter_projection(
+            specs,
+            adapt,
+            estimated_cost=estimated_cost,
+            estimated_rows=estimated_rows,
+        )
+
     def order_by_consumed(self, column: str, *, descending: bool = False) -> Self:
         """Declare ordering guaranteed by the most recent constraint plan."""
         column_index = self._column_position(column)
@@ -1171,6 +1443,7 @@ class GeneratorTableBuilder(_BaseTableBuilder[RowT]):
             estimated_cost=constraint_filter.estimated_cost,
             estimated_rows=constraint_filter.estimated_rows,
             order_by=(OrderTerm(column, column_index, descending),),
+            projection=constraint_filter.projection,
         )
         return self
 
@@ -1443,13 +1716,37 @@ class _RegistrationState(Generic[RowT]):
         self.transaction = _TransactionLifecycle(definition.transaction_hooks)
         self.lock = threading.RLock()
         self.shared_snapshot: _Snapshot[RowT] | None = None
+        # The rows a positional cached write resolves its position in once the
+        # shared snapshot is gone (C++ SharedCache::mutation_snapshot): for a
+        # shared table the pre-mutation shared rows, kept by the statement's
+        # first write until the next build; for a query-scoped table the rows
+        # its first write materialized, dropped by the next scan.
+        self.mutation_snapshot: _Snapshot[RowT] | None = None
         self.epoch = 0
         self.table_active = True
+        # The owning connection's write counter; registration attaches the
+        # connection's shared one.
+        self.write_counter = _WriteCounter()
 
     def invalidate(self) -> None:
         with self.lock:
             self.epoch += 1
             self.shared_snapshot = None
+            self.mutation_snapshot = None
+
+    def invalidate_after_mutation(self) -> None:
+        """Invalidate after a write, keeping the rows later writes of the statement name."""
+        with self.lock:
+            self.epoch += 1
+            kept = self.shared_snapshot or self.mutation_snapshot
+            self.mutation_snapshot = kept if kept is not None and kept.entries else None
+            self.shared_snapshot = None
+
+    def drop_statement_snapshot(self) -> None:
+        """A new scan of a query-scoped table starts a new statement."""
+        if not self.definition.shared:
+            with self.lock:
+                self.mutation_snapshot = None
 
     def snapshot(self, projection: Projection) -> _Snapshot[RowT]:
         if not self.definition.shared:
@@ -1470,6 +1767,7 @@ class _RegistrationState(Generic[RowT]):
                     use_projection=False,
                 )
                 self.shared_snapshot = snapshot
+                self.mutation_snapshot = None
             return self.shared_snapshot
 
     def run_coroutine(self, awaitable: Awaitable[ResultT]) -> ResultT:
@@ -1621,8 +1919,10 @@ class _Table(Generic[RowT]):
     def __init__(self, state: _RegistrationState[RowT]) -> None:
         self.state = state
         self.definition = state.definition
-        self._active_rows: dict[int, tuple[int, RowT]] = {}
-        self._active_lock = threading.RLock()
+        # A positional live table's per-statement snapshot (C++
+        # detail::LiveStatementPositions): the scanned positions this
+        # statement deleted, ascending. The next scan drops it.
+        self._deleted_positions: list[int] = []
 
     def BestIndexObject(self, info: apsw.IndexInfo) -> bool:
         planner = _Planner(self.definition, info)
@@ -1716,19 +2016,19 @@ class _Table(Generic[RowT]):
         if callback is None:
             msg = f"table {self.definition.name!r} does not support DELETE"
             raise ReadOnlyError(msg)
-        _validate_rowid(rowid)
-        if self.definition.kind is TableKind.INDEX:
-            argument: object = rowid
-        else:
-            argument = self._lookup_row(rowid)
+        _validate_rowid(rowid, key=_write_rowid_is_key(self.definition))
+        self._ensure_mutation_snapshot()
+        row = self._resolve_row(rowid, update=False)
         self.state.transaction.touch()
         self._before("delete")
         result = _invoke_callback(
             cast("_RegistrationState[object]", self.state),
-            cast("Callable[[object], bool | None]", callback),
-            argument,
+            callback,
+            row,
         )
         _require_callback_success("delete", value=result)
+        if _positional_live(self.definition):
+            insort(self._deleted_positions, rowid)
         self._modified("delete")
 
     def UpdateInsertRow(
@@ -1749,7 +2049,7 @@ class _Table(Generic[RowT]):
         for column, value in zip(self.definition.columns, fields, strict=True):
             if column.hidden:
                 continue
-            values[column.name] = _coerce_column_value(column, value)
+            values[column.name] = _coerce_written_value(column, value)
         self.state.transaction.touch()
         self._before("insert")
         result = cast(
@@ -1780,8 +2080,9 @@ class _Table(Generic[RowT]):
         new_rowid: int,
         fields: tuple[apsw.SQLiteValue | apsw.no_change, ...],
     ) -> None:
-        _validate_rowid(rowid)
-        _validate_rowid(new_rowid)
+        keyed = _write_rowid_is_key(self.definition)
+        _validate_rowid(rowid, key=keyed)
+        _validate_rowid(new_rowid, key=keyed)
         if rowid != new_rowid:
             msg = "changing a virtual-table rowid is not supported"
             raise ReadOnlyError(msg)
@@ -1792,7 +2093,7 @@ class _Table(Generic[RowT]):
         for column, value in zip(self.definition.columns, fields, strict=True):
             if value is apsw.no_change:
                 continue
-            changed.append((column, _coerce_column_value(column, value)))
+            changed.append((column, _coerce_written_value(column, value)))
         if not changed:
             return
         atomic = self.definition.update_row
@@ -1802,19 +2103,20 @@ class _Table(Generic[RowT]):
                 names = ", ".join(readonly)
                 msg = f"column(s) {names} are read-only"
                 raise ReadOnlyError(msg)
+        self._ensure_mutation_snapshot()
         self.state.transaction.touch()
         self._before("update")
+        row = self._resolve_row(rowid, update=True)
         if atomic is not None:
             changes = MappingProxyType({column.name: value for column, value in changed})
             result = _invoke_callback(
                 cast("_RegistrationState[object]", self.state),
                 atomic,
-                rowid,
+                row,
                 changes,
             )
             _require_callback_success("update", value=result)
         else:
-            row = self._lookup_row(rowid)
             applied: list[str] = []
             for column, value in changed:
                 # The immutable preflight above proved every changed column writable.
@@ -1838,7 +2140,30 @@ class _Table(Generic[RowT]):
                 applied.append(column.name)
         self._modified("update")
 
+    def _resolve_row(self, rowid: int, *, update: bool) -> RowT:
+        """Turn an UPDATE/DELETE rowid back into the row its callbacks receive.
+
+        The order is C++'s (cached_vtab_update; vtab_update for a live table):
+        a table with a row lookup resolves only through it; a cached table
+        without one resolves a cache POSITION; a positional live table reads the
+        row the statement scanned at that position. Nothing else is guessed.
+        """
+        definition = self.definition
+        if definition.stateful_row_lookup is not None or definition.row_lookup is not None:
+            return self._lookup_row(rowid)
+        if definition.kind is TableKind.CACHED:
+            return self._cached_position_row(rowid, update=update)
+        if _positional_live(definition):
+            return self._live_position_row(rowid)
+        # A keyed live table or a generator without a lookup: the builder and
+        # registration refuse both when writable (see _require_row_identity).
+        raise ReadOnlyError(_NO_ROW_RESOLVER)
+
     def _lookup_row(self, rowid: int) -> RowT:
+        # A row lookup is the sole authority for a table that has one: every
+        # rowid a cached table reports is the key it resolves (see
+        # _require_row_identity), so a rowid it cannot resolve is a row that is
+        # gone -- never a position to retry.
         if self.definition.stateful_row_lookup is not None:
             row = _invoke_callback(
                 cast("_RegistrationState[object]", self.state),
@@ -1847,8 +2172,7 @@ class _Table(Generic[RowT]):
                 rowid,
             )
             if row is None:
-                msg = f"rowid {rowid} no longer exists"
-                raise ProtocolError(msg)
+                raise ProtocolError(self._row_not_found(rowid))
             return row
         if self.definition.row_lookup is not None:
             row = _invoke_callback(
@@ -1857,42 +2181,104 @@ class _Table(Generic[RowT]):
                 rowid,
             )
             if row is None:
-                msg = f"rowid {rowid} no longer exists"
-                raise ProtocolError(msg)
+                raise ProtocolError(self._row_not_found(rowid))
             return row
-        with self._active_lock:
-            for active_rowid, row in reversed(tuple(self._active_rows.values())):
-                if active_rowid == rowid:
-                    return row
-        if self.definition.kind is TableKind.INDEX and self.definition.row_at is not None:
-            return _invoke_callback(
-                cast("_RegistrationState[object]", self.state),
-                self.definition.row_at,
-                rowid,
-            )
-        source = self.definition.source
-        if (
-            self.definition.kind is TableKind.INDEX
-            and source is not None
-            and not callable(source)
-            and isinstance(source, Sequence)
-        ):
-            try:
-                sequence_source: Sequence[RowT] = source
-                return sequence_source[rowid]
-            except IndexError as error:
-                msg = f"rowid {rowid} no longer exists"
-                raise ProtocolError(msg) from error
-        msg = "row_lookup() is required to reconstruct this row for mutation"
-        raise ReadOnlyError(msg)
+        raise ReadOnlyError(_NO_ROW_RESOLVER)
 
-    def _set_active(self, cursor: _Cursor[RowT], entry: _RowEntry[RowT] | None) -> None:
-        with self._active_lock:
-            key = id(cursor)
-            if entry is None:
-                self._active_rows.pop(key, None)
-            else:
-                self._active_rows[key] = (entry.rowid, entry.row)
+    def _cached_position_row(self, rowid: int, *, update: bool) -> RowT:
+        """Resolve a cache position, mirroring cached_vtab_update's positional branches.
+
+        Only a table without ``rowid()`` reports positions. A shared table finds
+        the position in its shared rows, or in the pre-mutation rows an earlier
+        write of the statement kept. A query-scoped table finds it in the
+        statement's snapshot, else in a fresh build. A position nothing holds
+        is no row; an UPDATE with no positional route at all is read-only.
+        """
+        definition = self.definition
+        state = self.state
+        if definition.rowid is None:
+            with state.lock:
+                rows = state.shared_snapshot or state.mutation_snapshot
+            if rows is not None and 0 <= rowid < len(rows.entries):
+                return rows.entries[rowid].row
+            if not definition.shared and _has_cache_builder(definition) and rowid >= 0:
+                rebuilt = self._full_rows()
+                if rowid < len(rebuilt.entries):
+                    return rebuilt.entries[rowid].row
+                raise ProtocolError(self._row_not_found(rowid))
+        if update:
+            raise ReadOnlyError(_NO_ROW_RESOLVER)
+        raise ProtocolError(self._row_not_found(rowid))
+
+    def _live_position_row(self, rowid: int) -> RowT:
+        """Read the row the statement scanned at a live table's position.
+
+        A delete callback removes its row and moves every later row up one, so
+        the row scanned at ``rowid`` now sits at ``rowid`` minus the positions
+        this statement already deleted before it (C++
+        ``LiveStatementPositions::current_index``). A position the statement
+        already deleted names no row.
+        """
+        deleted = self._deleted_positions
+        earlier = bisect_left(deleted, rowid)
+        if earlier < len(deleted) and deleted[earlier] == rowid:
+            raise ProtocolError(self._row_not_found(rowid))
+        index = rowid - earlier
+        definition = self.definition
+        source = definition.source
+        try:
+            if source is None:
+                row_at = cast("Callable[[int], RowT]", definition.row_at)
+                return _invoke_callback(
+                    cast("_RegistrationState[object]", self.state),
+                    row_at,
+                    index,
+                )
+            if isinstance(source, Sequence):
+                sequence = cast("Sequence[RowT]", source)
+                return sequence[index]
+        except IndexError as error:
+            raise ProtocolError(self._row_not_found(rowid)) from error
+        rows = self._full_rows()
+        if index < len(rows.entries):
+            return rows.entries[index].row
+        raise ProtocolError(self._row_not_found(rowid))
+
+    def drop_statement_positions(self) -> None:
+        """A new scan starts a new statement: forget the last one's deletes."""
+        self._deleted_positions.clear()
+
+    def _full_rows(self) -> _Snapshot[RowT]:
+        state = self.state
+        with state.callback_scope():
+            return _materialize_snapshot(
+                self.definition,
+                _FULL_PROJECTION,
+                state.run_coroutine,
+                state.transaction.state,
+                use_projection=False,
+            )
+
+    def _ensure_mutation_snapshot(self) -> None:
+        """Snapshot a query-scoped positional table's rows at the statement's first write.
+
+        Mirrors ensure_query_scoped_mutation_snapshot: a multi-row UPDATE/DELETE
+        then resolves every position in the rows the statement scanned, not in a
+        rebuild of rows an earlier write already shifted. A failed build fails
+        the write before any callback runs and leaves nothing to reuse.
+        """
+        state = self.state
+        if not _uses_mutation_snapshot(self.definition):
+            return
+        with state.lock:
+            if state.mutation_snapshot is not None:
+                return
+        rows = self._full_rows()
+        with state.lock:
+            state.mutation_snapshot = rows
+
+    def _row_not_found(self, rowid: int) -> str:
+        return f"row {rowid} not found in {self.definition.name}"
 
     def _before(self, operation: str) -> None:
         if self.definition.before_modify is not None:
@@ -1904,7 +2290,9 @@ class _Table(Generic[RowT]):
 
     def _modified(self, operation: str) -> None:
         self.state.transaction.mark_written()
-        self.state.invalidate()
+        if self.definition.counts_as_write:
+            self.state.write_counter.value += 1
+        self.state.invalidate_after_mutation()
         if self.definition.after_modify is not None:
             _invoke_callback(
                 cast("_RegistrationState[object]", self.state),
@@ -1929,7 +2317,7 @@ class _Planner(Generic[RowT]):
                 self.limit_constraint = source_index
             elif op is ConstraintOp.OFFSET:
                 self.offset_constraint = source_index
-            else:
+            elif (info.get_aConstraint_collation(source_index) or "BINARY").upper() == "BINARY":
                 self.usable.append((source_index, column_index, op))
         self.projection = _projection(definition, info.colUsed)
         self.order_by = tuple(
@@ -1946,7 +2334,7 @@ class _Planner(Generic[RowT]):
         if rowid is not None:
             return rowid
         constraint_filter, missing_constraint_target = self._constraint_filter_plan()
-        if constraint_filter is not None:
+        if constraint_filter is not None and constraint_filter[1] < self._single_column_cost():
             return constraint_filter
         regular_filter = self._filter_plan()
         if regular_filter is not None:
@@ -1961,7 +2349,7 @@ class _Planner(Generic[RowT]):
                 projection=self.projection,
                 order_by=self.order_by,
             )
-            return plan, 1.0, 1, False
+            return plan, _REJECT_COST, 1, False
         if (
             not self.usable
             and not self.projection.column_indices
@@ -1974,7 +2362,7 @@ class _Planner(Generic[RowT]):
             return plan, 1.0, count, False
         if self.definition.full_scan_message is not None:
             plan = _Plan(_PlanKind.REJECT, projection=self.projection, order_by=self.order_by)
-            return plan, 1.0, 1, False
+            return plan, _REJECT_COST, 1, False
         rows = _estimated_rows(self.definition)
         plan = _Plan(_PlanKind.FULL, projection=self.projection, order_by=self.order_by)
         return plan, float(max(rows, 1)), rows, False
@@ -2028,7 +2416,9 @@ class _Planner(Generic[RowT]):
                     _PlannedConstraint(match[0], match[1], match[2], spec.exact),
                 )
             if required_missing:
-                if missing_target < 0:
+                # Generator tables reject a scan missing a required input; a
+                # cached table can always fall back to its own rows instead.
+                if missing_target < 0 and self.definition.kind is not TableKind.CACHED:
                     missing_target = target
                 continue
             if not matches:
@@ -2065,6 +2455,11 @@ class _Planner(Generic[RowT]):
             for source_index, candidate_column, op in self.usable:
                 if candidate_column != column_index or op is not filter_definition.op:
                     continue
+                if op in _PATTERN_OPS and not _like_constraint_has_usable_prefix(
+                    self.info,
+                    source_index,
+                ):
+                    continue
                 constraint = _PlannedConstraint(
                     source_index,
                     column_index,
@@ -2090,6 +2485,37 @@ class _Planner(Generic[RowT]):
                 if best is None or candidate[0] < best[0]:
                     best = candidate
         return None if best is None else best[1]
+
+    def _single_column_cost(self) -> float:
+        """Cost a constraint filter must beat to be chosen, for every table kind.
+
+        The cheapest usable single-column filter (equality, or a LIKE/GLOB
+        pattern with a usable prefix) and, for a shared cache, an equality index
+        lookup priced at 1.0. The constraint filter must be strictly cheaper, so
+        a single-column filter wins a tie. With neither, any constraint filter
+        wins. Parametric filters are constraint filters and compete the same way.
+        """
+        best = _REJECT_COST
+        for filter_definition in self.definition.filters:
+            column_index = self.definition.column_index(filter_definition.column)
+            for source_index, candidate_column, op in self.usable:
+                if candidate_column != column_index or op is not filter_definition.op:
+                    continue
+                if op is ConstraintOp.EQ or (
+                    op in _PATTERN_OPS
+                    and _like_constraint_has_usable_prefix(self.info, source_index)
+                ):
+                    best = min(best, filter_definition.estimated_cost)
+        if self.definition.shared:
+            indexed = {
+                self.definition.column_index(index.column) for index in self.definition.indexes
+            }
+            if any(
+                candidate_column in indexed and op is ConstraintOp.EQ
+                for _source, candidate_column, op in self.usable
+            ):
+                best = min(best, 1.0)
+        return best
 
     def _index_plan(self) -> tuple[_Plan, float, int, bool] | None:
         for target, index_definition in enumerate(self.definition.indexes):
@@ -2175,6 +2601,21 @@ class _Cursor(Generic[RowT]):
         self._seen_rowids: set[int] = set()
         self._next_position = 0
         self._count_only_context: GeneratorContext | None = None
+        # Rows a full-scan, index or cache-filter plan materialized for a table
+        # without a shared cache: kept for this cursor's lifetime (a join's inner
+        # loop filters many times) and dropped when a write invalidates the table.
+        self._scoped_snapshot: tuple[int, Projection, _Snapshot[RowT]] | None = None
+
+    def _index_snapshot(self, projection: Projection) -> _Snapshot[RowT]:
+        state = self.table.state
+        if self.definition.shared:
+            return state.snapshot(projection)
+        scoped = self._scoped_snapshot
+        if scoped is not None and scoped[0] == state.epoch and scoped[1] == projection:
+            return scoped[2]
+        snapshot = state.snapshot(projection)
+        self._scoped_snapshot = (state.epoch, projection, snapshot)
+        return snapshot
 
     def Filter(
         self,
@@ -2184,6 +2625,8 @@ class _Cursor(Generic[RowT]):
     ) -> None:
         with self.table.state.callback_scope():
             self.table.state.transaction.begin_statement()
+            self.table.state.drop_statement_snapshot()
+            self.table.drop_statement_positions()
             self._filter(index_number, index_name, constraint_args)
 
     def _filter(  # noqa: C901, PLR0912, PLR0915 - dispatches immutable SQLite plans.
@@ -2244,8 +2687,12 @@ class _Cursor(Generic[RowT]):
             self._count_only_context = context
             entries = (_RowEntry(rowid, cast("RowT", None)) for rowid in range(count))
         elif plan.kind is _PlanKind.ROWID:
-            value = constraints[0].value
-            if not isinstance(value, int) or isinstance(value, bool):
+            # Exact: `rowid = 1.0` and `rowid = '1'` find row 1, as they do
+            # natively; `rowid = 1.5` and `rowid = 'a'` find nothing. The row
+            # lookup is the sole authority: the rowid is a key of any sign, and
+            # one it cannot resolve is no row, never a cached row by position.
+            value = _equality_key(ColumnType.INTEGER, constraints[0].value)
+            if not isinstance(value, int):
                 entries = ()
             else:
                 stateful_row_lookup = self.definition.stateful_row_lookup
@@ -2263,15 +2710,52 @@ class _Cursor(Generic[RowT]):
                     entries = () if row is None else (_RowEntry(value, row),)
         elif plan.kind is _PlanKind.FILTER:
             single_filter = self.definition.filters[plan.target]
-            rows = single_filter.factory(constraints[0].value)
-            entries = self._entries_from_source(rows)
+            value = constraints[0].value
+            if single_filter.op is ConstraintOp.EQ and single_filter.exact:
+                # SQLite trusts an exact equality filter's rows, so the factory
+                # sees the value as the column compares it, and is not called
+                # for one no row can equal (10.5 on an INTEGER column, NULL).
+                column_type = self.definition.columns[plan.constraints[0].column_index].type
+                value = _equality_key(column_type, value)
+            if value is _NO_MATCH:
+                entries = ()
+            elif single_filter.projection:
+                projection_factory = cast("ProjectionFilterFactory[RowT]", single_filter.factory)
+                entries = self._entries_from_source(
+                    projection_factory(value, plan.projection),
+                )
+            else:
+                value_factory = cast("FilterFactory[RowT]", single_filter.factory)
+                entries = self._entries_from_source(value_factory(value))
         elif plan.kind is _PlanKind.CONSTRAINT_FILTER:
             constraint_filter = self.definition.constraint_filters[plan.target]
-            rows = constraint_filter.factory(constraints)
-            entries = self._entries_from_source(rows)
+            if constraint_filter.factory is None:
+                snapshot = self._index_snapshot(plan.projection)
+                compared = _with_column_affinity(self.definition, constraints)
+                entries = tuple(
+                    entry
+                    for entry in snapshot.entries
+                    if _cache_filter_matches(self.definition, entry.row, compared)
+                )
+            elif constraint_filter.projection:
+                projection_constraints = cast(
+                    "ProjectionConstraintFactory[RowT]",
+                    constraint_filter.factory,
+                )
+                entries = self._entries_from_source(
+                    projection_constraints(constraints, plan.projection),
+                )
+            else:
+                plain_constraints = cast("ConstraintFactory[RowT]", constraint_filter.factory)
+                entries = self._entries_from_source(plain_constraints(constraints))
         elif plan.kind in {_PlanKind.INDEX_EQ, _PlanKind.INDEX_RANGE}:
-            snapshot = self.table.state.snapshot(plan.projection)
-            positions = _indexed_positions(snapshot, self.definition, plan, constraints)
+            snapshot = self._index_snapshot(plan.projection)
+            positions = _indexed_positions(
+                snapshot,
+                self.definition,
+                plan,
+                _with_column_affinity(self.definition, constraints),
+            )
             entries = (snapshot.entries[position] for position in positions)
         else:
             entries = self._full_scan(context)
@@ -2317,8 +2801,8 @@ class _Cursor(Generic[RowT]):
         try:
             self._close_iterators()
         finally:
-            self.table._set_active(self, None)
             self._count_only_context = None
+            self._scoped_snapshot = None
             self._current = None
             self._eof = True
 
@@ -2342,7 +2826,10 @@ class _Cursor(Generic[RowT]):
                 _invoke_source(cast("Source[RowT]", self.definition.source)),
             )
         if self.definition.kind is TableKind.CACHED:
-            return self.table.state.snapshot(context.projection).entries
+            # Cursor-lived like the index/cache-filter plans: a join's inner loop
+            # re-filters one cursor per outer row, and rebuilding the rows each
+            # time made an N-row join pay N full builds. A write invalidates it.
+            return self._index_snapshot(context.projection).entries
         if self.definition.context_source is not None:
             return self._entries_from_source(self.definition.context_source(context))
         if self.definition.projection_source is not None:
@@ -2380,7 +2867,6 @@ class _Cursor(Generic[RowT]):
         position = phantom.rowid - context.offset
         self._count_only_context = None
         self._close_iterators()
-        self.table._set_active(self, None)
         self._current = None
         self._eof = True
         self._seen_rowids.clear()
@@ -2399,10 +2885,8 @@ class _Cursor(Generic[RowT]):
             raise ProtocolError(msg) from error
         self._current = cast("_RowEntry[RowT]", current)
         self._eof = False
-        self.table._set_active(self, self._current)
 
     def _advance(self) -> None:
-        self.table._set_active(self, None)
         iterator = self._iterator
         if iterator is None:
             self._current = None
@@ -2416,7 +2900,6 @@ class _Cursor(Generic[RowT]):
             return
         self._current = current
         self._eof = False
-        self.table._set_active(self, current)
 
     def _require_current(self) -> _RowEntry[RowT]:
         if self._current is None or self._eof:
@@ -2429,7 +2912,6 @@ class _Cursor(Generic[RowT]):
             msg = "virtual-table cursor is closed"
             raise ClosedError(msg)
         self._close_iterators()
-        self.table._set_active(self, None)
         self._iterator = None
         self._async_iterator = None
         self._current = None
@@ -2589,6 +3071,7 @@ class Registration:
             self._active = False
             self._table_active = False
             self._state.invalidate()
+            _untrack_connection_state(self._state)
 
     close = unregister
 
@@ -2618,6 +3101,7 @@ class Registration:
             self._active = False
             self._table_active = False
             self._state.invalidate()
+            _untrack_connection_state(self._state)
 
     def __enter__(self) -> Self:
         """Return this active registration."""
@@ -2652,6 +3136,98 @@ class Registration:
         await self.aclose()
 
 
+# Connection-wide invalidation (libxsql's cache_registry). A SQL function that
+# changes the engine behind the tables -- renames a symbol, re-runs analysis --
+# is not a write through a table and usually holds no Registration, so every
+# live registration's state is reachable from its raw APSW connection. Keys and
+# members are weak: a closed-and-dropped connection or a released module leaves
+# nothing behind, and no entry keeps a connection alive.
+_CONNECTION_STATES_LOCK = threading.Lock()
+_CONNECTION_STATES: weakref.WeakKeyDictionary[
+    apsw.Connection,
+    weakref.WeakSet[_RegistrationState[object]],
+] = weakref.WeakKeyDictionary()
+
+
+def _track_connection_state(
+    connection: apsw.Connection,
+    state: _RegistrationState[object],
+) -> None:
+    with _CONNECTION_STATES_LOCK:
+        states = _CONNECTION_STATES.get(connection)
+        if states is None:
+            states = weakref.WeakSet()
+            _CONNECTION_STATES[connection] = states
+        states.add(state)
+
+
+class _WriteCounter:
+    """One connection's count of accepted virtual-table row writes."""
+
+    __slots__ = ("__weakref__", "value")
+
+    def __init__(self) -> None:
+        self.value = 0
+
+
+# Per-connection virtual-table write counters (libxsql's vtab_write_count). Weak
+# keys: a closed-and-dropped connection leaves nothing behind.
+_WRITE_COUNTERS: weakref.WeakKeyDictionary[apsw.Connection, _WriteCounter] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _connection_write_counter(connection: apsw.Connection) -> _WriteCounter:
+    with _CONNECTION_STATES_LOCK:
+        counter = _WRITE_COUNTERS.get(connection)
+        if counter is None:
+            counter = _WriteCounter()
+            _WRITE_COUNTERS[connection] = counter
+        return counter
+
+
+def vtab_write_count(connection: apsw.Connection) -> int:
+    """Return the row writes ``connection``'s virtual tables accepted.
+
+    Every INSERT, UPDATE or DELETE row write a table's callback carried out
+    counts, on tables that count as writes (see
+    :meth:`CachedTableBuilder.counts_as_write`). Temp and ordinary SQLite tables
+    never count, unlike ``total_changes``; a refused write does not count; and a
+    later ``ROLLBACK`` does not lower it, because SQLite does not undo a host
+    write. Compare two readings to ask "did a host-backed table change since X?".
+    """
+    with _CONNECTION_STATES_LOCK:
+        counter = _WRITE_COUNTERS.get(connection)
+    return 0 if counter is None else counter.value
+
+
+def _untrack_connection_state(state: _RegistrationState[object]) -> None:
+    with _CONNECTION_STATES_LOCK:
+        for connection, states in tuple(_CONNECTION_STATES.items()):
+            states.discard(state)
+            if not states:
+                del _CONNECTION_STATES[connection]
+
+
+def invalidate_cached_tables(connection: apsw.Connection) -> None:
+    """Invalidate every table registered on ``connection``, as a write would.
+
+    Call it from code that mutates the data source behind the tables outside
+    SQL -- typically a SQL function that renames, re-analyzes, or redefines
+    what the tables read. It reaches every live registration on the raw APSW
+    connection, including ones made with :func:`register_definition` whose
+    :class:`Registration` handle was dropped. Each table is invalidated exactly
+    as a successful write through it would be: a scan already in flight keeps
+    the rows it started with, and every later probe or statement rebuilds from
+    the live source. The states are collected under the registry lock and
+    invalidated outside it. A connection with no registrations is a no-op.
+    """
+    with _CONNECTION_STATES_LOCK:
+        states = tuple(_CONNECTION_STATES.get(connection, ()))
+    for state in states:
+        state.invalidate()
+
+
 def register_definition(
     connection: apsw.Connection,
     definition: TableDefinition[RowT],
@@ -2661,6 +3237,7 @@ def register_definition(
     interrupt_checker: InterruptChecker | None = None,
 ) -> Registration:
     """Register and create one virtual table on an APSW connection."""
+    _require_row_identity(definition)
     name = _validate_identifier(table_name or definition.name, "table")
     schema_name = _validate_identifier(schema, "schema")
     module_name = f"_libxsql_{uuid.uuid4().hex}"
@@ -2693,6 +3270,8 @@ def register_definition(
                 _discard_awaitable(cast("Awaitable[object]", cleanup))
         msg = f"could not register virtual table {name!r}"
         raise RegistrationError(msg) from error
+    _track_connection_state(connection, cast("_RegistrationState[object]", state))
+    state.write_counter = _connection_write_counter(connection)
     return Registration(
         connection,
         cast("TableDefinition[object]", definition),
@@ -2713,6 +3292,7 @@ async def async_register_definition(  # noqa: PLR0913 - explicit adapter configu
     interrupt_checker: InterruptChecker | None = None,
 ) -> Registration:
     """Register and create one virtual table on an APSW async connection."""
+    _require_row_identity(definition)
     name = _validate_identifier(table_name or definition.name, "table")
     schema_name = _validate_identifier(schema, "schema")
     module_name = f"_libxsql_{uuid.uuid4().hex}"
@@ -2746,6 +3326,8 @@ async def async_register_definition(  # noqa: PLR0913 - explicit adapter configu
             await _await_maybe(_call_create_module(connection, module_name, None))
         msg = f"could not register virtual table {name!r}"
         raise RegistrationError(msg) from error
+    _track_connection_state(connection, cast("_RegistrationState[object]", state))
+    state.write_counter = _connection_write_counter(connection)
     return Registration(
         connection,
         cast("TableDefinition[object]", definition),
@@ -2855,6 +3437,417 @@ def _sqlite_sort_key(value: SQLiteValue) -> tuple[int, int | float | str | bytes
     return 3, value
 
 
+class _NoMatch(Enum):
+    """No value of the column's storage class can equal the constraint value."""
+
+    NO_MATCH = "no-match"
+
+
+_NO_MATCH: Final = _NoMatch.NO_MATCH
+
+
+class _AffinityProbe:
+    """A private SQLite connection that applies column affinity exactly.
+
+    SQLite hands a virtual table the constraint's value without the column's
+    affinity, but compares a native column only after applying it: numeric
+    text becomes a number for an INTEGER or REAL column (by SQLite's own
+    parser: whitespace, signs, exponents, too-large integers become reals,
+    hex stays text), and a number becomes its SQLite text for a TEXT column.
+    Storing the value into a column of that affinity and reading it back via
+    RETURNING is SQLite applying exactly that rule.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._connection: apsw.Connection | None = None
+
+    def apply(self, value: SQLiteValue, *, numeric: bool) -> SQLiteValue:
+        statement = _NUMERIC_AFFINITY_SQL if numeric else _TEXT_AFFINITY_SQL
+        with self._lock:
+            if self._connection is None:
+                connection = apsw.Connection(":memory:")
+                connection.execute(
+                    "CREATE TABLE probe(id INTEGER PRIMARY KEY, number NUMERIC, text TEXT)",
+                )
+                self._connection = connection
+            row = self._connection.execute(statement, (value,)).fetchone()
+        return _normalize_sqlite_value(cast("tuple[object]", row)[0])
+
+
+_NUMERIC_AFFINITY_SQL: Final = (
+    "INSERT OR REPLACE INTO probe(id, number) VALUES (1, ?) RETURNING number"
+)
+_TEXT_AFFINITY_SQL: Final = "INSERT OR REPLACE INTO probe(id, text) VALUES (1, ?) RETURNING text"
+_AFFINITY_PROBE: Final = _AffinityProbe()
+# The storage classes a value of each column type can hold (libxsql enforces them).
+_STORAGE_CLASSES: Final[Mapping[ColumnType, tuple[type[object], ...]]] = MappingProxyType(
+    {
+        ColumnType.INTEGER: (int,),
+        ColumnType.REAL: (int, float),
+        ColumnType.TEXT: (str,),
+        ColumnType.BLOB: (bytes,),
+        ColumnType.ANY: (int, float, str, bytes),
+    },
+)
+
+
+def _apply_affinity(column_type: ColumnType, value: SQLiteValue) -> SQLiteValue:
+    """``value`` with the affinity SQLite applies when comparing it to the column."""
+    if column_type in {ColumnType.INTEGER, ColumnType.REAL} and isinstance(value, str):
+        return _AFFINITY_PROBE.apply(value, numeric=True)
+    if column_type is ColumnType.TEXT and isinstance(value, (int, float)):
+        return _AFFINITY_PROBE.apply(value, numeric=False)
+    return value
+
+
+def _equality_key(column_type: ColumnType, value: SQLiteValue) -> SQLiteValue | _NoMatch:
+    """The value an equality lookup on the column should use, or ``_NO_MATCH``.
+
+    libxsql enforces each typed column's storage class, so after affinity only
+    a value of that class can equal a row: an integral number within int64 for
+    INTEGER (returned as an ``int``), a number for REAL, text for TEXT, bytes
+    for BLOB. NULL equals nothing.
+    """
+    value = _apply_affinity(column_type, value)
+    if (
+        column_type is ColumnType.INTEGER
+        and isinstance(value, float)
+        and value.is_integer()
+        and _MIN_ROWID <= value <= _MAX_ROWID
+    ):
+        value = int(value)
+    if value is None or not isinstance(value, _STORAGE_CLASSES[column_type]):
+        return _NO_MATCH
+    return value
+
+
+def _with_column_affinity(
+    definition: TableDefinition[RowT],
+    constraints: tuple[Constraint, ...],
+) -> tuple[Constraint, ...]:
+    """Constraints whose values carry their column's affinity (see ``_apply_affinity``)."""
+    return tuple(
+        replace(
+            constraint,
+            value=_apply_affinity(
+                definition.columns[constraint.column_index].type,
+                constraint.value,
+            ),
+        )
+        for constraint in constraints
+    )
+
+
+def exact_int64(value: SQLiteValue) -> int | None:
+    """The int64 an INTEGER column value must equal to match ``value``, or ``None``.
+
+    A constraint or parametric filter factory receives the constraint value
+    exactly as SQLite handed it to the virtual table -- no column affinity --
+    and its plan is trusted (SQLite does not re-check the rows). Call this
+    instead of ``int(value)``: an integer is itself; a real only when it is
+    integral and within int64 (``10.0`` -> 10, ``10.5`` -> ``None``); text only
+    when SQLite's INTEGER affinity makes it such a number (``'10'``, ``' 10 '``,
+    ``'1e1'`` -> 10; ``'0x10'`` and ``'a'`` -> ``None``); NULL and blobs never.
+    ``None`` means no row can match, so the factory should yield no rows.
+    """
+    key = _equality_key(ColumnType.INTEGER, value)
+    return key if isinstance(key, int) else None
+
+
+def exact_text(value: SQLiteValue) -> str | None:
+    """The text a TEXT column value must equal to match ``value``, or ``None``.
+
+    Text is itself; a number gets TEXT affinity, which is SQLite's rendering
+    of it (``10`` -> ``'10'``, ``10.5`` -> ``'10.5'``); NULL and blobs never
+    equal text. ``None`` means no row can match.
+    """
+    key = _equality_key(ColumnType.TEXT, value)
+    return key if isinstance(key, str) else None
+
+
+@dataclass(frozen=True, slots=True)
+class U64Span:
+    """An inclusive span of unsigned 64-bit keys, ``lo <= hi``.
+
+    Produced by :meth:`Int64KeyRange.unsigned_spans`.
+    """
+
+    lo: int
+    hi: int
+
+
+class Int64KeyRange:
+    """The inclusive window of int64 keys satisfying every comparison applied.
+
+    Each comparison is ``key <op> value`` evaluated the way SQLite compares an
+    INTEGER column: ``constrain(ConstraintOp.GE, 14.5)`` keeps keys >= 15,
+    ``constrain(ConstraintOp.LT, 'a')`` keeps every key (text sorts after all
+    numbers), and a NULL operand -- or an EQ value no integer can equal --
+    empties the window. A new range holds every int64.
+
+    Use it in a constraint-filter factory whose GT/GE/LT/LE/EQ constraints are
+    on one integer key column::
+
+        keys = Int64KeyRange()
+        for constraint in constraints:
+            keys.constrain(constraint.op, constraint.value)
+        if keys.empty:
+            return ()
+        return scan(keys.lower, keys.upper)  # both inclusive
+    """
+
+    __slots__ = ("_empty", "_lower", "_upper")
+
+    def __init__(self) -> None:
+        """Start with every int64 key."""
+        self._lower = _MIN_ROWID
+        self._upper = _MAX_ROWID
+        self._empty = False
+
+    def constrain(self, op: ConstraintOp, value: SQLiteValue) -> bool:
+        """Narrow the window to keys satisfying ``key <op> value``.
+
+        ``value`` is the raw constraint value, or an ``int`` the caller
+        resolved itself (a symbol name parsed to an address, say). Returns ``False`` once the
+        window is empty. LIKE (or any operator other than EQ, GT, GE, LT and
+        LE) is not an integer key comparison: the window empties and
+        :class:`~libxsql.ConfigurationError` is raised, so a mis-routed
+        constraint fails the query instead of matching.
+        """
+        if op not in _CACHE_FILTER_OPS:
+            self._empty = True
+            msg = f"{op.name} is not an integer key comparison"
+            raise ConfigurationError(msg)
+        if op is ConstraintOp.EQ:
+            key = exact_int64(value)
+            if key is None:
+                self._empty = True
+                return False
+            self._narrow(key, key)
+        else:
+            operand = _apply_affinity(ColumnType.INTEGER, value)
+            if op in {ConstraintOp.GT, ConstraintOp.GE}:
+                bound = _lower_key_bound(operand, strict=op is ConstraintOp.GT)
+                if bound is not None:
+                    self._narrow(bound, _MAX_ROWID)
+            else:
+                bound = _upper_key_bound(operand, strict=op is ConstraintOp.LT)
+                if bound is not None:
+                    self._narrow(_MIN_ROWID, bound)
+        return not self._empty
+
+    @property
+    def empty(self) -> bool:
+        """Whether no key satisfies the comparisons applied so far."""
+        return self._empty
+
+    @property
+    def lower(self) -> int:
+        """The smallest key in the window (the int64 minimum when unbounded below)."""
+        return self._lower
+
+    @property
+    def upper(self) -> int:
+        """The largest key in the window (the int64 maximum when unbounded above)."""
+        return self._upper
+
+    def contains(self, key: int) -> bool:
+        """Whether ``key`` satisfies every comparison applied so far."""
+        return not self._empty and self._lower <= key <= self._upper
+
+    def unsigned_spans(self, *, descending: bool = False) -> list[U64Span]:
+        """The window as unsigned 64-bit spans, in the order SQL sorts the keys.
+
+        For tables whose key is really an unsigned 64-bit value (an address)
+        stored as a bit-cast int64. Keys >= 2**63 reach SQL as negative
+        integers, so SQL order is the high half first (most negative first),
+        then 0, then the low half, while the engine walks unsigned. A walker
+        that claims ``ORDER BY key``, or omits the constraint, must visit the
+        spans in the order returned here:
+
+        ================  ==========================================
+        window            spans
+        ================  ==========================================
+        empty             none
+        ``lo, hi >= 0``   ``[lo, hi]``
+        ``lo, hi < 0``    ``[u(lo), u(hi)]``
+        ``lo < 0 <= hi``  ``[u(lo), 2**64 - 1]``, then ``[0, hi]``
+        ================  ==========================================
+
+        where ``u()`` is the bit-cast to uint64. ``descending`` reverses the
+        order of the spans; each span stays ``lo <= hi``, and the walker decides
+        how to walk it (downward, for a descending walk). A span only says what
+        SQL order requires: it does not clamp to anything the engine can
+        address.
+
+        Gotcha for anyone writing such queries: SQLite reads a decimal literal
+        >= 2**63 (``18446744073709551613``) as a REAL, which no INTEGER key
+        equals and which bounds the window past every key. Write a hex literal
+        (``0xFFFFFFFFFFFFFFFD``, read as 64-bit two's complement) or the
+        negative decimal (``-3``). And ``key >= 0xFFFFF80000000000`` also
+        includes every low-half key; ``key BETWEEN 0xFFFFF80000000000 AND -1``
+        is the high half.
+        """
+        if self._empty or self._lower > self._upper:
+            return []
+        lo = self._lower & _U64_MAX
+        hi = self._upper & _U64_MAX
+        if self._lower < 0 <= self._upper:
+            spans = [U64Span(lo, _U64_MAX), U64Span(0, hi)]
+        else:
+            spans = [U64Span(lo, hi)]
+        if descending:
+            spans.reverse()
+        return spans
+
+    def _narrow(self, lower: int | _NoKeyBound, upper: int | _NoKeyBound) -> None:
+        if lower is _EMPTY_BOUND or upper is _EMPTY_BOUND:
+            self._empty = True
+            return
+        self._lower = max(self._lower, lower)
+        self._upper = min(self._upper, upper)
+        if self._lower > self._upper:
+            self._empty = True
+
+
+class _NoKeyBound(Enum):
+    """A range bound no int64 key can satisfy."""
+
+    EMPTY = "empty"
+
+
+_EMPTY_BOUND: Final = _NoKeyBound.EMPTY
+
+
+def _lower_key_bound(operand: SQLiteValue, *, strict: bool) -> int | _NoKeyBound | None:
+    """The inclusive int64 lower bound meaning ``key > operand`` (or ``>=``).
+
+    ``operand`` already carries INTEGER affinity. Returns ``_EMPTY_BOUND`` when
+    no key qualifies and ``None`` when every key does.
+    """
+    if operand is None or isinstance(operand, (str, bytes)):
+        # NULL compares with nothing; text and blobs sort after every number.
+        return _EMPTY_BOUND
+    if isinstance(operand, float):
+        if math.isnan(operand) or operand == math.inf:
+            return _EMPTY_BOUND
+        if operand == -math.inf:
+            return None
+        # key > r <=> key >= floor(r) + 1;  key >= r <=> key >= ceil(r).
+        bound = math.floor(operand) + 1 if strict else math.ceil(operand)
+    else:
+        bound = operand + 1 if strict else operand
+    if bound > _MAX_ROWID:
+        return _EMPTY_BOUND
+    return None if bound <= _MIN_ROWID else bound
+
+
+def _upper_key_bound(operand: SQLiteValue, *, strict: bool) -> int | _NoKeyBound | None:
+    """The inclusive int64 upper bound meaning ``key < operand`` (or ``<=``).
+
+    ``operand`` already carries INTEGER affinity. Returns ``_EMPTY_BOUND`` when
+    no key qualifies and ``None`` when every key does.
+    """
+    if operand is None:
+        return _EMPTY_BOUND
+    if isinstance(operand, (str, bytes)):
+        return None
+    if isinstance(operand, float):
+        if math.isnan(operand) or operand == -math.inf:
+            return _EMPTY_BOUND
+        if operand == math.inf:
+            return None
+        # key < r <=> key <= ceil(r) - 1;  key <= r <=> key <= floor(r).
+        bound = math.ceil(operand) - 1 if strict else math.floor(operand)
+    else:
+        bound = operand - 1 if strict else operand
+    if bound < _MIN_ROWID:
+        return _EMPTY_BOUND
+    return None if bound >= _MAX_ROWID else bound
+
+
+def _normalized_constraint_specs(
+    specs: Iterable[ConstraintSpec],
+    api: str,
+) -> tuple[ConstraintSpec, ...]:
+    normalized = tuple(specs)
+    if not normalized:
+        msg = f"{api} requires at least one constraint"
+        raise ConfigurationError(msg)
+    if len({(spec.column, spec.op) for spec in normalized}) != len(normalized):
+        msg = f"{api} contains duplicate column/operator pairs"
+        raise ConfigurationError(msg)
+    return normalized
+
+
+def _sqlite_text(value: SQLiteValue) -> str:
+    """Return SQLite's text form of a pattern argument (NULL becomes empty)."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _like_constraint_has_usable_prefix(info: apsw.IndexInfo, source_index: int) -> bool:
+    """Whether a LIKE/GLOB pattern has a literal prefix a filter can seek on.
+
+    Unknown at plan time (a bound parameter) counts as usable: the filter stays
+    a superset that SQLite re-checks, so the worst case is a full walk. APSW
+    reports SQL NULL the same way as unknown, which is safe for the same reason.
+    """
+    rhs = info.get_aConstraint_rhs(source_index)
+    if rhs is None:
+        return True
+    text = _sqlite_text(_normalize_sqlite_value(rhs))
+    return bool(text) and text[0] not in _LIKE_UNUSABLE_LEADS
+
+
+def _cache_filter_matches(
+    definition: TableDefinition[RowT],
+    row: RowT,
+    constraints: tuple[Constraint, ...],
+) -> bool:
+    """Evaluate a cache-backed constraint filter against one materialized row."""
+    for constraint in constraints:
+        if constraint.value is None:
+            return False
+        index_definition = next(
+            index for index in definition.indexes if index.column == constraint.column
+        )
+        key = _normalize_sqlite_value(index_definition.key(row))
+        if key is None:
+            return False
+        left = _sqlite_sort_key(key)
+        right = _sqlite_sort_key(constraint.value)
+        if not _compare_sort_keys(constraint.op, left, right):
+            return False
+    return True
+
+
+def _compare_sort_keys(
+    op: ConstraintOp,
+    left: tuple[int, int | float | str | bytes],
+    right: tuple[int, int | float | str | bytes],
+) -> bool:
+    """Apply one of the :data:`_CACHE_FILTER_OPS` in SQLite's value ordering."""
+    if left[0] != right[0]:
+        # Different storage classes: SQLite orders NULL < numeric < text < blob.
+        order = (left[0] > right[0]) - (left[0] < right[0])
+    else:
+        order = cast("int", (left[1] > right[1]) - (left[1] < right[1]))  # type: ignore[operator]
+    if op is ConstraintOp.EQ:
+        return order == 0
+    if op is ConstraintOp.GT:
+        return order > 0
+    if op is ConstraintOp.GE:
+        return order >= 0
+    if op is ConstraintOp.LT:
+        return order < 0
+    return order <= 0
+
+
 def _coerce_column_value(column: Column[RowT], value: object) -> SQLiteValue:
     normalized = _normalize_sqlite_value(value)
     if normalized is None:
@@ -2878,6 +3871,44 @@ def _coerce_column_value(column: Column[RowT], value: object) -> SQLiteValue:
         msg = f"column {column.name!r} requires bytes"
         raise ProtocolError(msg)
     return normalized
+
+
+# Why a value written to an INTEGER column equals no integer, by storage class.
+_INTEGER_REFUSALS: Final[Mapping[type[object], str]] = MappingProxyType(
+    {
+        type(None): "NULL",
+        bytes: "a blob",
+        float: "a non-integral or out-of-range real",
+        str: "non-integer text",
+    },
+)
+
+
+def _coerce_written_value(column: Column[RowT], value: object) -> SQLiteValue:
+    """The value an INSERT or UPDATE writes to ``column``, as its callback sees it.
+
+    SQLite applies no column affinity to the values a virtual table's write
+    receives, so ``16.0`` arrives as a real and ``'16'`` as text. An INTEGER
+    column takes the integer the value equals under SQLite's INTEGER
+    comparison (:func:`exact_int64`: ``16``, ``16.0``, ``'16'``, ``' 16 '``
+    and ``'1e1'`` are integers) and refuses anything else -- a non-integral or
+    out-of-range real, non-integer text, a blob, and NULL unless the column is
+    nullable -- with ``column "<name>": expected an integer, got ...``. Other
+    column types keep :func:`_coerce_column_value`.
+    """
+    if column.type is not ColumnType.INTEGER:
+        return _coerce_column_value(column, value)
+    normalized = _normalize_sqlite_value(value)
+    if normalized is None and (column.nullable or column.hidden):
+        return None
+    # Typed writes reject incomplete numeric strings, independently of the
+    # linked SQLite version's comparison-affinity treatment of embedded NUL.
+    key = None if isinstance(normalized, str) and "\0" in normalized else exact_int64(normalized)
+    if key is None:
+        got = _INTEGER_REFUSALS[type(normalized)]
+        msg = f'column "{column.name}": expected an integer, got {got}'
+        raise ProtocolError(msg)
+    return key
 
 
 def _validate_count(value: object, label: str) -> int:
@@ -2907,7 +3938,8 @@ def _validate_cost(value: float) -> float:
     return result
 
 
-def _validate_rowid(value: int) -> int:
+def _validate_rowid(value: int, *, key: bool = False) -> int:
+    """Check a rowid; only a KEY (see :func:`_keyed_rowids`) may be negative."""
     raw_value = cast("object", value)
     if isinstance(raw_value, bool) or not isinstance(raw_value, int):
         msg = "rowid must be an integer"
@@ -2915,15 +3947,118 @@ def _validate_rowid(value: int) -> int:
     if not _MIN_ROWID <= raw_value <= _MAX_ROWID:
         msg = f"rowid {raw_value} is outside SQLite's signed 64-bit range"
         raise ProtocolError(msg)
-    if raw_value < 0:
+    if raw_value < 0 and not key:
         msg = f"negative rowid {raw_value} is not accepted by libxsql table adapters"
         raise ProtocolError(msg)
     return raw_value
 
 
+def _keyed_rowids(definition: TableDefinition[RowT]) -> bool:
+    """Whether the table's rowids are keys that may be negative.
+
+    A cached or generator table with ``rowid()`` reports ``rowid(row)`` from
+    every plan, and ``row_lookup()`` resolves that key; a key may be negative
+    (an address at or above ``2**63``). A live table's rowid stays a
+    non-negative position or key, like the C++ live table's.
+    """
+    return definition.kind is not TableKind.INDEX and definition.rowid is not None
+
+
+_NO_ROW_RESOLVER: Final = "row_lookup() is required to reconstruct this row for mutation"
+# Positional writes materialize complete rows: a projection would change nothing
+# a position names, and the full source is what a shared cache is built from.
+_FULL_PROJECTION: Final = Projection((), ())
+
+
+def _write_rowid_is_key(definition: TableDefinition[RowT]) -> bool:
+    """Whether an UPDATE/DELETE rowid may be negative.
+
+    A cached table takes a rowid of any sign, as the C++ cached xUpdate does: a
+    key may be negative, and a negative position simply names no row. A live
+    table refuses one before any callback, like the C++ live xUpdate.
+    """
+    return definition.kind is TableKind.CACHED or _keyed_rowids(definition)
+
+
+def _has_cache_builder(definition: TableDefinition[RowT]) -> bool:
+    """A full row source, as C++ ``has_cache_builder()`` (a projection builder is not one)."""
+    return definition.source is not None or definition.stateful_source is not None
+
+
+def _positional_live(definition: TableDefinition[RowT]) -> bool:
+    """Whether a live table's rowid is a position: no ``rowid()`` and no row lookup."""
+    return (
+        definition.kind is TableKind.INDEX
+        and definition.rowid is None
+        and definition.row_lookup is None
+        and definition.stateful_row_lookup is None
+    )
+
+
+def _uses_mutation_snapshot(definition: TableDefinition[RowT]) -> bool:
+    """Whether writes snapshot the rows once per statement (query_scoped_uses_mutation_snapshot).
+
+    Only a query-scoped cached table whose rowids are positions: no row lookup,
+    no ``rowid()``, no single-column filter, and a full source to build from.
+    """
+    return (
+        definition.kind is TableKind.CACHED
+        and not definition.shared
+        and _has_cache_builder(definition)
+        and definition.row_lookup is None
+        and definition.stateful_row_lookup is None
+        and definition.rowid is None
+        and not definition.filters
+    )
+
+
+def _require_row_identity(definition: TableDefinition[RowT]) -> None:
+    """Reject a table that could read a position as a key, or a key as a position.
+
+    A cached table's row lookup is the only thing UPDATE, DELETE and
+    ``WHERE rowid = ?`` use to turn a rowid back into a row, so every rowid the
+    table reports must be the key it resolves. Without ``rowid()`` a scan reports
+    a POSITION, and a position read as a key names a different, existing row.
+    Conversely a writable live table with ``rowid()`` reports keys, which
+    ``row_at()`` or its sequence would read as positions, so it must resolve
+    them with a row lookup. Checked when building and again when registering a
+    hand-made definition.
+    """
+    has_lookup = definition.row_lookup is not None or definition.stateful_row_lookup is not None
+    if (
+        definition.kind is TableKind.INDEX
+        and definition.rowid is not None
+        and not has_lookup
+        and (
+            definition.delete_row is not None
+            or definition.update_row is not None
+            or any(column.writable for column in definition.columns)
+        )
+    ):
+        msg = (
+            f"live table {definition.name!r}: a writable table with rowid() requires "
+            "row_lookup(): its rowids are keys, not the positions row_at() and the "
+            "row sequence resolve"
+        )
+        raise ConfigurationError(msg)
+    if definition.kind is not TableKind.CACHED or definition.rowid is not None:
+        return
+    if definition.row_lookup is not None:
+        api = "row_lookup()"
+    elif definition.stateful_row_lookup is not None:
+        api = "stateful_row_lookup()"
+    else:
+        return
+    msg = (
+        f"cached table {definition.name!r}: {api} requires rowid(): scans must "
+        f"report the same key {api} resolves, not a cache position"
+    )
+    raise ConfigurationError(msg)
+
+
 def _rowid(definition: TableDefinition[RowT], row: RowT, position: int) -> int:
     value = definition.rowid(row) if definition.rowid is not None else position
-    return _validate_rowid(value)
+    return _validate_rowid(value, key=_keyed_rowids(definition))
 
 
 def _estimated_rows(definition: TableDefinition[RowT]) -> int:
@@ -3075,7 +4210,8 @@ def _indexed_positions(  # noqa: C901 - exact/range index modes share snapshot s
                 building.setdefault(key, []).append(position)
             equality = {key: tuple(value) for key, value in building.items()}
             snapshot.equality[plan.target] = equality
-        return equality.get(constraints[0].value, ())
+        lookup = constraints[0].value
+        return () if lookup is None else equality.get(lookup, ())
     sorted_positions = snapshot.sorted_positions.get(plan.target)
     if sorted_positions is None:
         sortable = tuple(
@@ -3181,6 +4317,7 @@ __all__ = [
     "GeneratorTableBuilder",
     "GeneratorTableBuilderStart",
     "Index",
+    "Int64KeyRange",
     "OrderTerm",
     "Projection",
     "Registration",
@@ -3188,9 +4325,13 @@ __all__ = [
     "TableDefinition",
     "TableKind",
     "TransactionHooks",
+    "U64Span",
     "async_register_definition",
     "cached_table",
+    "exact_int64",
+    "exact_text",
     "generator_table",
+    "invalidate_cached_tables",
     "optional",
     "optional_eq",
     "optional_ge",
@@ -3207,4 +4348,5 @@ __all__ = [
     "required_like",
     "required_lt",
     "table",
+    "vtab_write_count",
 ]

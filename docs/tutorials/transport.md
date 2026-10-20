@@ -15,3 +15,12 @@ and `POST /shutdown` require the configured bearer or X-XSQL token by default.
 Set `status_requires_auth=False` only for an intentionally public health probe.
 `ThinClient.cancel()` and `AsyncThinClient.cancel()` request cooperative
 cancellation of the active query.
+
+`HttpQueryServerConfig` mirrors the C++ server's options. A
+`streaming_executor` answers requests that carry `X-XSQL-Stream: 1` (JSON
+envelope) or `X-XSQL-Stream: ndjson` row by row, and a stream the requested
+`?format=` cannot produce is rejected with HTTP 400. `X-XSQL-Timeout` sets a
+per-request timeout in milliseconds. Responses are gzip-compressed when the
+client sends `Accept-Encoding: gzip`, and `keep_alive_max_count` (default 1000)
+bounds the requests served on one connection. A `cancel_handler` runs after
+`POST /cancel` cancels local work; if it raises, the route answers 502.

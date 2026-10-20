@@ -1129,6 +1129,29 @@ class Connection:
         return int(self._raw.changes())
 
     @property
+    def total_changes(self) -> int:
+        """Return rows changed by INSERT/UPDATE/DELETE since the connection opened.
+
+        Virtual-table writes are included (``sqlite3_total_changes64``).
+        """
+        self._check()
+        return int(self._raw.total_changes())
+
+    @property
+    def vtab_write_count(self) -> int:
+        """Return the row writes this connection's virtual tables accepted.
+
+        Counts every INSERT, UPDATE or DELETE row write a counting table's
+        callback carried out; temp and ordinary SQLite tables never count, and a
+        later ``ROLLBACK`` does not lower it. See
+        :func:`libxsql.vtable.vtab_write_count`.
+        """
+        self._check()
+        from .vtable import vtab_write_count
+
+        return vtab_write_count(self._raw)
+
+    @property
     def in_transaction(self) -> bool:
         """Whether SQLite currently has an active transaction."""
         self._check()
@@ -1371,6 +1394,22 @@ class Connection:
         )
         self._registrations.append(registration)
         return registration
+
+    def invalidate_cached_tables(self) -> None:
+        """Invalidate every table registered on this connection, as a write would.
+
+        For a caller that changes the data behind the tables outside SQL; a SQL
+        function uses :meth:`FunctionContext.invalidate_cached_tables`. It also
+        reaches tables registered on the same APSW connection with
+        :func:`libxsql.vtable.register_definition`. A scan already in flight keeps
+        its rows; later probes and statements rebuild. Thread-safe, and a no-op
+        once the connection is closed.
+        """
+        if self._closed:
+            return
+        from .vtable import invalidate_cached_tables
+
+        invalidate_cached_tables(self._raw)
 
     def run_script(
         self,
@@ -1902,6 +1941,16 @@ class AsyncConnection:
         self._check()
         return bool(await self._raw.async_run(lambda: self._raw.in_transaction))
 
+    async def changes(self) -> int:
+        """Return the last statement's changed-row count on the owning worker."""
+        self._check()
+        return int(await self._raw.async_run(self._raw.changes))
+
+    async def total_changes(self) -> int:
+        """Return the connection's total changed-row count on the owning worker."""
+        self._check()
+        return int(await self._raw.async_run(self._raw.total_changes))
+
     async def execute(
         self,
         sql: str,
@@ -2340,6 +2389,32 @@ class AsyncConnection:
         )
         self._registrations.append(registration)
         return registration
+
+    def invalidate_cached_tables(self) -> None:
+        """Invalidate every table registered on this connection, as a write would.
+
+        Synchronous: it touches only in-process table state, never SQLite, so it
+        needs no worker round trip. A scan already in flight keeps its rows;
+        later probes and statements rebuild. A no-op once the connection is
+        closed. See :meth:`Connection.invalidate_cached_tables`.
+        """
+        if self._closed:
+            return
+        from .vtable import invalidate_cached_tables
+
+        invalidate_cached_tables(self._raw)
+
+    @property
+    def vtab_write_count(self) -> int:
+        """Return the row writes this connection's virtual tables accepted.
+
+        Synchronous: the counter is in-process state, so it needs no worker
+        round trip. See :attr:`Connection.vtab_write_count`.
+        """
+        self._check()
+        from .vtable import vtab_write_count
+
+        return vtab_write_count(self._raw)
 
     async def run_script(
         self,

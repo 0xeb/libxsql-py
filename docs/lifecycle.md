@@ -47,6 +47,15 @@ surprising cross-query identity.
 `registration.invalidate()` whenever the backing data changes outside a
 registered mutation. Successful table mutations invalidate automatically.
 
+Query-scoped rows live for one SQLite cursor, so a join's inner table is built
+once per statement rather than once per outer row. A SQL function that changes
+the data behind the tables (a rename, a re-analysis) is not a write through a
+table and usually holds no registration: it calls
+`context.invalidate_cached_tables()`, and host code outside SQL calls
+`connection.invalidate_cached_tables()`. Either invalidates every table on the
+connection exactly as a write would: a scan already in flight keeps its rows,
+and every later probe or statement rebuilds from the live source.
+
 Shared cache construction is atomic and single-flight. A failed or cancelled
 build never publishes a partial snapshot. Existing cursors retain the snapshot
 they started with, while later queries observe the replacement.
@@ -57,10 +66,15 @@ Writable definitions declare insert, delete, and update capabilities
 independently. Authorization is checked when a write is prepared, including
 statements that would affect zero rows.
 
-Atomic row-update callbacks are preferred. Per-column setters are retained for
-fine-grained integrations and run in schema order. If a later setter fails
-after an earlier external side effect, `PartialUpdateError` reports the columns
-already applied.
+Atomic row-update callbacks are preferred: `.updatable(callback)` calls
+`callback(row, changes)` with the resolved row and only the changed columns.
+Per-column setters are retained for fine-grained integrations and run in schema
+order. If a later setter fails after an earlier external side effect,
+`PartialUpdateError` reports the columns already applied. The row is resolved
+before any write callback runs, so a rowid that names no row changes nothing;
+see [row identity](api.md) for how each table family resolves it. A live
+table's positions name the rows the statement scanned, even after earlier
+deletes of the same statement moved later rows up; the next scan starts over.
 
 All three table families accept `.transaction_hooks(TransactionHooks(...))`.
 The state factory is invoked once per registration. `prepare_commit` is the

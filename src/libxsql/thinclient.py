@@ -22,16 +22,18 @@ import ipaddress
 import json
 import queue
 import random
+import re
 import socket
 import threading
 import time
+import zlib
 from collections.abc import Awaitable, Callable, Generator, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, Self, TypeAlias, cast
 from urllib.parse import parse_qs, urlencode
 
 import anyio
-from anyio import to_thread
+from anyio import from_thread, to_thread
 
 from .errors import ConfigurationError, ProtocolError
 from .script import (
@@ -61,9 +63,43 @@ if TYPE_CHECKING:
 QueryHandler = Callable[[str, ScriptOptions], object]
 StatusHandler = Callable[[], object]
 ExtraRouteHandler = Callable[["HttpRequest"], object]
+CancelHandler = Callable[[], object]
+StreamSink = Callable[[str | bytes], bool]
+AsyncStreamSink = Callable[[str | bytes], Awaitable[bool]]
+StreamingExecutor = Callable[..., object]
+"""``executor(sql, options, ndjson, sink)`` for true chunked ``/query`` responses.
+
+A synchronous executor runs on a worker thread and gets a :data:`StreamSink`; a
+coroutine function gets an :data:`AsyncStreamSink`. Either sink returns
+``False`` once the client has gone, after which the executor should stop.
+"""
 _MAX_PORT = 65_535
 _HTTP_OK = 200
 _HTTP_ERROR = 400
+_STREAM_FLUSH_BYTES = 64 * 1024
+_LEADING_INTEGER = re.compile(r"\s*([+-]?\d+)")
+# Media types gzip applies to, decided on the type alone (parameters ignored).
+_COMPRESSIBLE_TYPES = frozenset(
+    {
+        "image/svg+xml",
+        "application/javascript",
+        "application/json",
+        "application/xml",
+        "application/protobuf",
+        "application/x-ndjson",
+        "application/xhtml+xml",
+    },
+)
+
+
+class _Compressor(Protocol):
+    def compress(self, data: bytes, /) -> bytes:
+        """Compress ``data``, returning whatever output is ready."""
+        ...
+
+    def flush(self) -> bytes:
+        """Finish the stream and return the remaining output."""
+        ...
 
 
 class _HypercornServe(Protocol):
@@ -156,6 +192,21 @@ class HttpQueryServerConfig:
     max_body_bytes: int = 64 * 1024 * 1024
     allow_insecure_no_auth: bool = False
     status_requires_auth: bool = True
+    streaming_executor: StreamingExecutor | None = None
+    """Optional chunked executor, used when a request sends ``X-XSQL-Stream``.
+
+    ``X-XSQL-Stream: 1`` (or ``true``) asks for the JSON envelope streamed row
+    by row, ``X-XSQL-Stream: ndjson`` for one JSON object per line. Ignored in
+    queue mode, and the header is ignored when this is unset.
+    """
+    keep_alive_max_count: int = 1000
+    """Requests served on one kept-alive connection before it is closed."""
+    cancel_handler: CancelHandler | None = None
+    """Called by ``POST /cancel`` after the local cancellation, to forward it.
+
+    It may be synchronous or asynchronous. If it raises, ``/cancel`` answers
+    502 naming the failure instead of claiming the whole chain was cancelled.
+    """
 
     def __post_init__(self) -> None:
         """Validate values that otherwise fail late inside an HTTP server."""
@@ -171,6 +222,9 @@ class HttpQueryServerConfig:
         if self.max_body_bytes <= 0:
             msg = "max_body_bytes must be positive"
             raise ConfigurationError(msg)
+        if self.keep_alive_max_count <= 0:
+            msg = "keep_alive_max_count must be positive"
+            raise ConfigurationError(msg)
         _ensure_secure_bind(
             self.bind_address,
             self.auth_token,
@@ -181,6 +235,156 @@ class HttpQueryServerConfig:
 # Concise spelling retained for callers that do not need to distinguish the app
 # from the convenience server.
 HttpQueryConfig = HttpQueryServerConfig
+
+
+class StreamWriteCoalescer:
+    """Batch a streaming executor's per-row writes into larger physical writes.
+
+    A streaming executor writes once per row; sending each of those as its own
+    chunked frame costs several times more than the bytes themselves. This
+    buffers them and calls ``real_write`` once ``flush_threshold_bytes`` have
+    accumulated, keeping the bytes on the wire identical. Once ``real_write``
+    returns ``False`` (a disconnected client), every later :meth:`write` and
+    :meth:`flush` returns or does nothing without calling it again.
+    """
+
+    def __init__(
+        self,
+        real_write: Callable[[bytes], bool],
+        flush_threshold_bytes: int = _STREAM_FLUSH_BYTES,
+    ) -> None:
+        """Wrap ``real_write`` with a ``flush_threshold_bytes`` buffer."""
+        if flush_threshold_bytes <= 0:
+            msg = "flush_threshold_bytes must be positive"
+            raise ConfigurationError(msg)
+        self._real_write = real_write
+        self._threshold = flush_threshold_bytes
+        self._buffer = bytearray()
+        self._failed = False
+        self._real_write_count = 0
+
+    def write(self, data: str | bytes) -> bool:
+        """Buffer ``data``, flushing at the threshold; ``False`` once a write failed."""
+        if self._failed:
+            return False
+        self._buffer += data.encode() if isinstance(data, str) else data
+        if len(self._buffer) >= self._threshold:
+            self.flush()
+        return not self._failed
+
+    def flush(self) -> None:
+        """Send whatever is buffered. Safe to call repeatedly or after a failure."""
+        if not self._buffer or self._failed:
+            return
+        chunk = bytes(self._buffer)
+        self._buffer.clear()
+        self._real_write_count += 1
+        if not self._real_write(chunk):
+            self._failed = True
+
+    @property
+    def real_write_count(self) -> int:
+        """How many times ``real_write`` was called (for tests of the batching)."""
+        return self._real_write_count
+
+
+class _AsyncStreamWriteCoalescer:
+    """:class:`StreamWriteCoalescer` for a coroutine ``real_write``."""
+
+    def __init__(
+        self,
+        real_write: Callable[[bytes], Awaitable[bool]],
+        flush_threshold_bytes: int = _STREAM_FLUSH_BYTES,
+    ) -> None:
+        self._real_write = real_write
+        self._threshold = flush_threshold_bytes
+        self._buffer = bytearray()
+        self._failed = False
+
+    async def write(self, data: str | bytes) -> bool:
+        if self._failed:
+            return False
+        self._buffer += data.encode() if isinstance(data, str) else data
+        if len(self._buffer) >= self._threshold:
+            await self.flush()
+        return not self._failed
+
+    async def flush(self) -> None:
+        if not self._buffer or self._failed:
+            return
+        chunk = bytes(self._buffer)
+        self._buffer.clear()
+        if not await self._real_write(chunk):
+            self._failed = True
+
+
+class _ResponseChannel:
+    """Sends one ASGI response, whole or streamed, gzip'd when the client accepts it."""
+
+    def __init__(self, send: AsgiSend, receive: AsgiReceive, *, accept_encoding: str) -> None:
+        self._send = send
+        self._receive = receive
+        self._accept_gzip = "gzip" in accept_encoding
+        self._compressor: _Compressor | None = None
+        self.started = False
+        self.disconnected = False
+
+    def _gzip_for(self, content_type: str) -> bool:
+        return self._accept_gzip and _can_compress(content_type)
+
+    async def send_response(self, response: HttpResponse) -> None:
+        body = response.body
+        headers = _standard_headers(response.content_type)
+        if self._gzip_for(response.content_type):
+            compressor = _gzip_compressor()
+            body = compressor.compress(body) + compressor.flush()
+            headers.append((b"content-encoding", b"gzip"))
+        headers.append((b"content-length", str(len(body)).encode("ascii")))
+        headers.extend(
+            (name.lower().encode("latin-1"), value.encode("latin-1"))
+            for name, value in response.headers.items()
+        )
+        await self._send(
+            {"type": "http.response.start", "status": response.status, "headers": headers}
+        )
+        await self._send({"type": "http.response.body", "body": body})
+
+    async def watch_disconnect(self) -> None:
+        """Record the client's departure while a stream is being produced."""
+        while True:
+            message = await self._receive()
+            if message.get("type") == "http.disconnect":
+                self.disconnected = True
+                return
+
+    async def stream_write(self, content_type: str, data: bytes) -> bool:
+        """Start the stream on first use and send ``data``; ``False`` once the client left."""
+        if self.disconnected:
+            return False
+        if not self.started:
+            headers = _standard_headers(content_type)
+            if self._gzip_for(content_type):
+                self._compressor = _gzip_compressor()
+                headers.append((b"content-encoding", b"gzip"))
+            await self._send({"type": "http.response.start", "status": 200, "headers": headers})
+            self.started = True
+        if self._compressor is not None:
+            data = self._compressor.compress(data)
+        if data:
+            try:
+                await self._send({"type": "http.response.body", "body": data, "more_body": True})
+            except OSError:
+                self.disconnected = True
+                return False
+        return not self.disconnected
+
+    async def finish_stream(self, content_type: str) -> None:
+        """End the stream, first starting it if nothing was ever written."""
+        if not self.started:
+            await self.stream_write(content_type, b"")
+        tail = self._compressor.flush() if self._compressor is not None else b""
+        with contextlib.suppress(OSError):
+            await self._send({"type": "http.response.body", "body": tail, "more_body": False})
 
 
 @dataclass(slots=True)
@@ -272,10 +476,18 @@ class HttpQueryApp:
 
         request_or_response = await self._read_request(scope, receive)
         if isinstance(request_or_response, HttpResponse):
-            response = request_or_response
+            channel = _ResponseChannel(send, receive, accept_encoding="")
+            response: HttpResponse | None = request_or_response
         else:
-            response = await self._dispatch(request_or_response)
-        await self._send_response(response, send)
+            channel = _ResponseChannel(
+                send,
+                receive,
+                accept_encoding=request_or_response.headers.get("accept-encoding", ""),
+            )
+            response = await self._dispatch(request_or_response, channel)
+        if response is None:
+            return  # streamed
+        await channel.send_response(response)
         if response.request_shutdown and self._shutdown_callback is not None:
             self._shutdown_callback()
 
@@ -338,10 +550,11 @@ class HttpQueryApp:
             body=b"".join(chunks),
         )
 
-    async def _dispatch(  # noqa: C901, PLR0911 - each route terminates independently
+    async def _dispatch(  # noqa: PLR0911 - each route terminates independently
         self,
         request: HttpRequest,
-    ) -> HttpResponse:
+        channel: _ResponseChannel,
+    ) -> HttpResponse | None:
         if not self._authorized(request):
             return _error_response("Unauthorized", status=401)
 
@@ -362,14 +575,9 @@ class HttpQueryApp:
         if route == ("GET", "/status"):
             return await self._status()
         if route == ("POST", "/cancel"):
-            with self._active_cancellations_lock:
-                for cancellation in self._active_cancellations:
-                    cancellation.set()
-            return HttpResponse.json(
-                {"success": True, "message": "cancel requested"},
-            )
+            return await self._cancel()
         if route == ("POST", "/query"):
-            return await self._query(request)
+            return await self._query(request, channel)
         if route == ("POST", "/shutdown"):
             return HttpResponse(
                 status=200,
@@ -407,11 +615,33 @@ class HttpQueryApp:
                 return _error_response(str(exc), status=500)
         return HttpResponse.json(value)
 
+    async def _cancel(self) -> HttpResponse:
+        with self._active_cancellations_lock:
+            for cancellation in self._active_cancellations:
+                cancellation.set()
+        if self.config.cancel_handler is not None:
+            try:
+                await _invoke(self.config.cancel_handler)
+            except Exception as exc:  # noqa: BLE001 - downstream callback boundary
+                detail = f": {exc}" if str(exc) else ""
+                return _error_response(
+                    f"local cancellation requested, but downstream propagation failed{detail}",
+                    status=502,
+                )
+        return HttpResponse.json({"success": True, "message": "cancel requested"})
+
     async def _query(  # noqa: C901, PLR0911, PLR0912 - protocol decision tree
         self,
         request: HttpRequest,
-    ) -> HttpResponse:
-        if self.config.query_handler is None:
+        channel: _ResponseChannel,
+    ) -> HttpResponse | None:
+        stream_header = request.headers.get("x-xsql-stream", "")
+        stream = (
+            self.config.streaming_executor is not None
+            and not self.config.use_queue
+            and stream_header in {"1", "true", "ndjson"}
+        )
+        if self.config.query_handler is None and not stream:
             return _error_response("No query handler configured", status=503)
         try:
             sql, options = _decode_query(request)
@@ -422,11 +652,24 @@ class HttpQueryApp:
         output_format = request.parameter("format", "json") or "json"
         if output_format not in {"json", "jsonl", "text", "csv", "tsv"}:
             return _error_response("Unsupported format", status=400)
+        ndjson = stream_header == "ndjson"
+        if stream and not (output_format == "json" or (output_format == "jsonl" and ndjson)):
+            return _error_response(
+                f"?format={output_format} is incompatible with X-XSQL-Stream: {stream_header} "
+                "(streaming only supports json, or jsonl with X-XSQL-Stream: ndjson "
+                "-- drop ?format= or X-XSQL-Stream to use the other)",
+                status=400,
+            )
+
+        async def run() -> HttpResponse | None:
+            if stream:
+                return await self._stream_query(sql, options, ndjson=ndjson, channel=channel)
+            return await self._direct_query(sql, options, output_format)
 
         if self.config.use_queue:
             return await self._queued_query(sql, options, output_format)
         if not self.config.serialize_requests:
-            return await self._direct_query(sql, options, output_format)
+            return await run()
 
         with self._waiters_lock:
             if self.config.max_queue and self._waiters >= self.config.max_queue:
@@ -453,12 +696,64 @@ class HttpQueryApp:
                     hint="Reduce concurrency or increase queue_admission_timeout",
                 )
             try:
-                return await self._direct_query(sql, options, output_format)
+                # Held for the whole call, streamed responses included.
+                return await run()
             finally:
                 self._serialize_lock.release()
         finally:
             with self._waiters_lock:
                 self._waiters -= 1
+
+    async def _stream_query(
+        self,
+        sql: str,
+        options: ScriptOptions,
+        *,
+        ndjson: bool,
+        channel: _ResponseChannel,
+    ) -> HttpResponse | None:
+        """Run the streaming executor, sending its chunks as they are produced.
+
+        Returns an error response only if the executor failed before sending a
+        byte; once the stream has started, a failure just ends it.
+        """
+        executor = cast("StreamingExecutor", self.config.streaming_executor)
+        content_type = "application/x-ndjson" if ndjson else "application/json"
+
+        async def physical_write(data: bytes) -> bool:
+            return await channel.stream_write(content_type, data)
+
+        with self._active_query_options(options) as active_options:
+            async with anyio.create_task_group() as watchers:
+                watchers.start_soon(channel.watch_disconnect)
+                try:
+                    if _is_async_callable(executor):
+                        async_coalescer = _AsyncStreamWriteCoalescer(physical_write)
+                        await cast(
+                            "Awaitable[object]",
+                            executor(sql, active_options, ndjson, async_coalescer.write),
+                        )
+                        await async_coalescer.flush()
+                    else:
+
+                        def blocking_write(data: bytes) -> bool:
+                            return from_thread.run(physical_write, data)
+
+                        coalescer = StreamWriteCoalescer(blocking_write)
+
+                        def execute() -> None:
+                            executor(sql, active_options, ndjson, coalescer.write)
+                            coalescer.flush()
+
+                        await to_thread.run_sync(execute)
+                except Exception as exc:  # noqa: BLE001 - executor boundary
+                    if not channel.started:
+                        watchers.cancel_scope.cancel()
+                        return _error_response(str(exc), status=500)
+                finally:
+                    watchers.cancel_scope.cancel()
+        await channel.finish_stream(content_type)
+        return None
 
     async def _direct_query(
         self,
@@ -607,26 +902,6 @@ class HttpQueryApp:
         with self._queue_state_lock:
             self._accepting_queued_commands = True
 
-    async def _send_response(self, response: HttpResponse, send: AsgiSend) -> None:
-        headers = [
-            (b"content-type", response.content_type.encode("latin-1")),
-            (b"content-length", str(len(response.body)).encode("ascii")),
-            (b"cache-control", b"no-store"),
-            (b"x-content-type-options", b"nosniff"),
-        ]
-        headers.extend(
-            (name.lower().encode("latin-1"), value.encode("latin-1"))
-            for name, value in response.headers.items()
-        )
-        await send(
-            {
-                "type": "http.response.start",
-                "status": response.status,
-                "headers": headers,
-            },
-        )
-        await send({"type": "http.response.body", "body": response.body})
-
 
 @dataclass(frozen=True, slots=True)
 class ClientConfig:
@@ -640,8 +915,8 @@ class ClientConfig:
 
     @property
     def base_url(self) -> str:
-        """Return the normalized server base URL."""
-        return f"{self.scheme}://{self.host}:{self.port}"
+        """Return the normalized server base URL, bracketing an IPv6 host."""
+        return f"{self.scheme}://{_format_url_host(self.host)}:{self.port}"
 
 
 class ThinClient:
@@ -867,8 +1142,8 @@ class AsyncHttpQueryServer:
 
     @property
     def url(self) -> str:
-        """Return the active HTTP base URL."""
-        return f"http://{self.app.config.bind_address}:{self._port}"
+        """Return the listening base URL; see :func:`_format_url_host`."""
+        return f"http://{_format_url_host(self.app.config.bind_address)}:{self._port}"
 
     @property
     def is_running(self) -> bool:
@@ -900,7 +1175,7 @@ class AsyncHttpQueryServer:
             with anyio.fail_after(10):
                 while not await to_thread.run_sync(
                     _can_connect,
-                    self.app.config.bind_address,
+                    _connect_host(self.app.config.bind_address),
                     self._port,
                 ):
                     if self._serve_error is not None:
@@ -940,6 +1215,7 @@ class AsyncHttpQueryServer:
             config = _hypercorn_config(
                 self.app.config.bind_address,
                 self._port,
+                self.app.config.keep_alive_max_count,
             )
 
             async def shutdown_trigger() -> None:
@@ -989,8 +1265,8 @@ class HttpQueryServer:
 
     @property
     def url(self) -> str:
-        """Return the active HTTP base URL."""
-        return f"http://{self.app.config.bind_address}:{self._port}"
+        """Return the listening base URL; see :func:`_format_url_host`."""
+        return f"http://{_format_url_host(self.app.config.bind_address)}:{self._port}"
 
     @property
     def is_running(self) -> bool:
@@ -1073,13 +1349,42 @@ class HttpQueryServer:
 
 
 async def _invoke(callback: Callable[..., object], *args: object) -> object:
-    is_async = inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
-        type(callback).__call__,
-    )
+    is_async = _is_async_callable(callback)
     result = callback(*args) if is_async else await to_thread.run_sync(callback, *args)
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+def _is_async_callable(callback: Callable[..., object]) -> bool:
+    return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+        type(callback).__call__,
+    )
+
+
+def _standard_headers(content_type: str) -> list[tuple[bytes, bytes]]:
+    return [
+        (b"content-type", content_type.encode("latin-1")),
+        (b"cache-control", b"no-store"),
+        (b"x-content-type-options", b"nosniff"),
+    ]
+
+
+def _can_compress(content_type: str) -> bool:
+    """Whether gzip applies to a response, judged on its media type alone.
+
+    ``text/event-stream`` is excluded even with parameters: a compressed SSE
+    stream is held back until the compressor fills, so an event never arrives.
+    """
+    media_type = content_type.split(";", 1)[0].rstrip(" \t")
+    if media_type in _COMPRESSIBLE_TYPES:
+        return True
+    return media_type.startswith("text/") and media_type != "text/event-stream"
+
+
+def _gzip_compressor() -> _Compressor:
+    # Level 1: most of level 6's ratio on query results at a fraction of the time.
+    return zlib.compressobj(1, zlib.DEFLATED, 31)
 
 
 async def _coerce_response(value: object) -> HttpResponse:
@@ -1093,6 +1398,33 @@ async def _coerce_response(value: object) -> HttpResponse:
 
 
 def _decode_query(request: HttpRequest) -> tuple[str, ScriptOptions]:
+    sql, options = _decode_query_body(request)
+    timeout_ms = _timeout_header(request.headers.get("x-xsql-timeout"))
+    if timeout_ms is not None:
+        options = replace(options, timeout_ms=timeout_ms)
+    return sql, options
+
+
+def _timeout_header(value: str | None) -> int | None:
+    """Parse ``X-XSQL-Timeout: <ms>`` the way ``std::stol`` does; invalid is ignored.
+
+    Leading whitespace, a sign, and trailing text after the digits are accepted;
+    a negative or unparsable value leaves the request's timeout unchanged.
+    """
+    if value is None:
+        return None
+    match = _LEADING_INTEGER.match(value)
+    if match is None:
+        return None
+    digits = match.group(1)
+    negative = digits.startswith("-")
+    milliseconds = 0
+    for digit in digits.lstrip("+-"):
+        milliseconds = min(milliseconds * 10 + int(digit), 2**31 - 1)
+    return milliseconds if not negative or milliseconds == 0 else None
+
+
+def _decode_query_body(request: HttpRequest) -> tuple[str, ScriptOptions]:
     options = ScriptOptions(
         continue_on_error=_flag(request.parameter("continue_on_error")),
         include_sql=_flag(request.parameter("include_sql")),
@@ -1199,7 +1531,10 @@ def _root_welcome(tool_name: str, port: int) -> str:
         "  POST /cancel   - Cancel the active query\n"
         "  POST /shutdown - Stop server\n\n"
         f"Example: curl -X POST http://localhost:{port}/query "
-        "-d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n"
+        "--data-binary \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n"
+        # -d '' sends Content-Length: 0; some clients leave a bodyless POST
+        # unframed, and the server then waits for a body instead of cancelling.
+        f"Cancel:  curl -X POST -d '' http://localhost:{port}/cancel\n"
     )
 
 
@@ -1208,6 +1543,8 @@ def _default_help() -> str:
         "POST /query accepts UTF-8 SQL or an application/json object containing "
         '"sql". Query parameters: format=json|jsonl|text|csv|tsv, '
         "continue_on_error=1, include_sql=1.\n"
+        "Headers: X-XSQL-Timeout: <ms> sets the query timeout; X-XSQL-Stream: 1 "
+        "(or ndjson) streams the result when the server has a streaming executor.\n"
     )
 
 
@@ -1285,6 +1622,35 @@ def _is_loopback(address: str) -> bool:
         return False
 
 
+def _format_url_host(host: str) -> str:
+    """Render a bind or client host for a URL.
+
+    An empty host is ``127.0.0.1`` and a bare IPv6 literal is bracketed
+    (``::1`` -> ``[::1]``), so ``url`` reads ``http://[::1]:8100``. A wildcard
+    bind is rendered as bound (``0.0.0.0``, ``[::]``); the address a client
+    dials for it is :func:`_connect_host`. Mirrors C++/Rust ``format_url_host``.
+    """
+    host = host or "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _connect_host(bind_host: str) -> str:
+    """Return the address a client dials to reach a server bound to ``bind_host``.
+
+    A wildcard bind accepts connections but is not dialable (Windows refuses to
+    connect to ``0.0.0.0`` or ``::``), so it maps to the matching loopback.
+    Unbracketed, for :mod:`socket`; C++/Rust ``format_connect_url_host``.
+    """
+    host = (bind_host or "127.0.0.1").strip("[]")
+    return {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)  # noqa: S104
+
+
+def _socket_family(address: str) -> socket.AddressFamily:
+    return socket.AF_INET6 if ":" in address else socket.AF_INET
+
+
 def _select_port(address: str, requested: int) -> int:
     if requested:
         if not _port_available(address, requested):
@@ -1296,14 +1662,14 @@ def _select_port(address: str, requested: int) -> int:
     for candidate in candidates:
         if _port_available(address, candidate):
             return candidate
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    with socket.socket(_socket_family(address), socket.SOCK_STREAM) as sock:
         sock.bind((address, 0))
         return int(sock.getsockname()[1])
 
 
 def _port_available(address: str, port: int) -> bool:
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with socket.socket(_socket_family(address), socket.SOCK_STREAM) as sock:
             sock.bind((address, port))
     except OSError:
         return False
@@ -1335,11 +1701,18 @@ def _require_hypercorn() -> None:
         raise ImportError(msg) from None
 
 
-def _hypercorn_config(address: str, port: int) -> Any:  # noqa: ANN401 - optional adapter
+def _hypercorn_config(
+    address: str,
+    port: int,
+    keep_alive_max_requests: int,
+) -> Any:  # noqa: ANN401 - optional adapter
     from hypercorn.config import Config  # noqa: PLC0415 - optional thinclient extra
 
     config = Config()
     config.bind = [f"{address}:{port}"]
+    # A batch client issuing many small queries must not be forced to
+    # reconnect every few requests.
+    config.keep_alive_max_requests = keep_alive_max_requests
     config.accesslog = None
     config.errorlog = None
     config.use_reloader = False
@@ -1400,5 +1773,6 @@ __all__ = [
     "HttpQueryServerConfig",
     "HttpRequest",
     "HttpResponse",
+    "StreamWriteCoalescer",
     "ThinClient",
 ]

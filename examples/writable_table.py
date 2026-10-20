@@ -39,8 +39,9 @@ def main() -> None:
         task.done = bool(value)
         return True
 
-    def delete(index: int) -> bool:
-        del tasks[index]
+    def delete(task: Task) -> bool:
+        # Like the setters, the delete callback receives the row itself.
+        tasks.remove(task)
         return True
 
     definition = (
